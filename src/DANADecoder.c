@@ -661,7 +661,7 @@ struct DANAStreamingDecoder* DANAStreamingDecoder_Create(const struct DANAStream
     if (decoder->decoder_core == NULL) { free(decoder); return NULL; }
 
     decoder->queue = DANADataPacketQueue_Create(DANA_STREAMING_DECODE_MAX_NUM_PACKETS);
-    if (decoder->queue == NULL) { free(decoder->decoder_core); free(decoder); return NULL; }
+    if (decoder->queue == NULL) { DANADecoder_Destroy(decoder->decoder_core); free(decoder); return NULL; }
 
     decoder->decode_interval_hz = config->decode_interval_hz;
     decoder->max_bit_per_sample = config->max_bit_per_sample;
@@ -675,13 +675,15 @@ struct DANAStreamingDecoder* DANAStreamingDecoder_Create(const struct DANAStream
     }
 
     if (DANAStreamingDecoder_Reset(decoder) != DANA_APIRESULT_OK) {
-        free(decoder->decoder_core); free(decoder->data_buffer); free(decoder->queue);
         if (decoder->pcm_cache) {
             for (uint32_t ch = 0; ch < config->core_config.max_num_channels; ch++) {
                 free(decoder->pcm_cache[ch]);
             }
             free(decoder->pcm_cache);
         }
+        DANADecoder_Destroy(decoder->decoder_core);
+        DANADataPacketQueue_Destroy(decoder->queue);
+        NULLCHECK_AND_FREE(decoder->data_buffer);
         free(decoder); return NULL;
     }
     return decoder;
@@ -689,15 +691,15 @@ struct DANAStreamingDecoder* DANAStreamingDecoder_Create(const struct DANAStream
 
 void DANAStreamingDecoder_Destroy(struct DANAStreamingDecoder* decoder) {
     if (decoder != NULL) {
-        DANADecoder_Destroy(decoder->decoder_core);
-        DANADataPacketQueue_Destroy(decoder->queue);
-        NULLCHECK_AND_FREE(decoder->data_buffer);
         if (decoder->pcm_cache) {
             for (uint32_t ch = 0; ch < decoder->decoder_core->max_num_channels; ch++) {
                 free(decoder->pcm_cache[ch]);
             }
             free(decoder->pcm_cache);
         }
+        DANADecoder_Destroy(decoder->decoder_core);
+        DANADataPacketQueue_Destroy(decoder->queue);
+        NULLCHECK_AND_FREE(decoder->data_buffer);
         free(decoder);
     }
 }
