@@ -13,11 +13,11 @@
 #define DANABITSTREAM_FLAGS_MODE_READ  (1 << 0)
 #define DANABITSTREAM_FLAGS_EOS        (1 << 1)
 
-extern const uint32_t g_sla_bitstream_lower_bits_mask[33];
-extern const uint32_t g_sla_bitstream_zerobit_runlength_table[0x100];
+extern const uint32_t g_dana_bitstream_lower_bits_mask[33];
+extern const uint32_t g_dana_bitstream_zerobit_runlength_table[0x100];
 
 static inline uint32_t DANABITSTREAM_GETLOWERBITS(uint64_t val, uint32_t nbits) {
-    return (uint32_t)(val & g_sla_bitstream_lower_bits_mask[nbits]);
+    return (uint32_t)(val & g_dana_bitstream_lower_bits_mask[nbits]);
 }
 
 struct DANABitStream {
