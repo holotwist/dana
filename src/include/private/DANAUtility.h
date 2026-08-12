@@ -4,7 +4,7 @@
 #include "DANAStdint.h"
 #include <stddef.h> 
 
-#if defined(__SSE4_1__)
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)) && defined(__SSE4_1__)
 #define USE_SSE
 #include <x86intrin.h>
 #endif

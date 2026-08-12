@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <float.h>
 
-#ifdef __AVX2__
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)) && defined(__AVX2__)
 #include <immintrin.h>
 #endif
 
