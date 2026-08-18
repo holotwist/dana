@@ -27,5 +27,5 @@ void draw_info_panel(int y, int x, int h, int w) {
         mvprintw(line++, x + 2, "Bit rate    : %u kbps", ui_cache.bps / 1000);
         mvprintw(line++, x + 2, "Bits/sample : %-9u", ui_cache.fmt.bit_per_sample);
         mvprintw(line++, x + 2, "Duration    : %02u:%02u", tot_sec / 60, tot_sec % 60);
-    }1
+    }
 }
