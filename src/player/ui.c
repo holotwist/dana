@@ -11,6 +11,34 @@
 #include <unistd.h>
 #include <math.h>
 
+// Helpers for UTF-8 sliding
+static int utf8_strlen(const char *str) {
+    int len = 0;
+    for (int i = 0; str[i] != '\0'; ) {
+        unsigned char c = (unsigned char)str[i];
+        if ((c & 0x80) == 0) i += 1;
+        else if ((c & 0xE0) == 0xC0) i += 2;
+        else if ((c & 0xF0) == 0xE0) i += 3;
+        else if ((c & 0xF8) == 0xF0) i += 4;
+        else i += 1; 
+        len++;
+    }
+    return len;
+}
+
+static int utf8_byte_offset(const char *str, int char_offset) {
+    int byte_offset = 0;
+    for (int i = 0; i < char_offset && str[byte_offset] != '\0'; i++) {
+        unsigned char c = (unsigned char)str[byte_offset];
+        if ((c & 0x80) == 0) byte_offset += 1;
+        else if ((c & 0xE0) == 0xC0) byte_offset += 2;
+        else if ((c & 0xF0) == 0xE0) byte_offset += 3;
+        else if ((c & 0xF8) == 0xF0) byte_offset += 4;
+        else byte_offset += 1; 
+    }
+    return byte_offset;
+}
+
 static void draw_box(int y, int x, int h, int w, const char* title, int color_pair) {
     attron(COLOR_PAIR(color_pair));
     mvhline(y, x+1, ACS_HLINE, w-2);
@@ -26,6 +54,9 @@ static void draw_box(int y, int x, int h, int w, const char* title, int color_pa
 }
 
 static void ui_loop(void) {
+    static unsigned long frame_counter = 0;
+    frame_counter++;
+
     if (force_redraw) {
         erase();
         force_redraw = false;
@@ -61,6 +92,21 @@ static void ui_loop(void) {
         memset(&cached_fmt, 0, sizeof(cached_fmt));
         cached_bps = 0;
         cached_filename[0] = '\0';
+        
+        // Follow the currently playing track
+        if (playing_file_idx >= 0 && playing_file_idx < num_files) {
+            selected_file_idx = playing_file_idx;
+            
+            int list_h = top_h - 4;
+            if (list_h > 0) {
+                if (selected_file_idx < scroll_offset) {
+                    scroll_offset = selected_file_idx;
+                } else if (selected_file_idx >= scroll_offset + list_h) {
+                    scroll_offset = selected_file_idx - list_h + 1;
+                }
+            }
+        }
+
         cached_idx = playing_file_idx;
         header_loaded_for_idx = -2;
         force_redraw = true;
@@ -114,12 +160,57 @@ static void ui_loop(void) {
         
         int list_h = top_h - 4;
         for (int i = 0; i < list_h; i++) mvhline(i + 3, 1, ' ', left_w - 2);
+        
+        static int last_selected_idx = -1;
+        if (last_selected_idx != selected_file_idx) {
+            last_selected_idx = selected_file_idx;
+            frame_counter = 0; // Reset scroll animation when selection changes
+        }
+
+        int max_disp_len = left_w - 4;
+        if (max_disp_len < 1) max_disp_len = 1;
+
         for (int i = 0; i < list_h && i + scroll_offset < num_files; i++) {
             int idx = i + scroll_offset;
+            
             if (idx == selected_file_idx) attron(A_REVERSE | COLOR_PAIR(1));
             else if (files[idx].is_dir) attron(COLOR_PAIR(3));
             else attron(COLOR_PAIR(2));
-            mvprintw(i + 3, 2, "%-30.30s", files[idx].name);
+            
+            int name_chars = utf8_strlen(files[idx].name);
+            int char_offset = 0;
+            
+            // Text sliding effect for long names
+            if (idx == selected_file_idx && name_chars > max_disp_len) {
+                int max_scroll = name_chars - max_disp_len;
+                int scroll_speed = 6; 
+                int hold_frames = 50; // Holds aprox 750ms at start & end
+                int cycle_frames = hold_frames * 2 + max_scroll * scroll_speed;
+                int cycle_pos = frame_counter % cycle_frames;
+
+                if (cycle_pos < hold_frames) {
+                    char_offset = 0;
+                } else if (cycle_pos < hold_frames + max_scroll * scroll_speed) {
+                    char_offset = (cycle_pos - hold_frames) / scroll_speed;
+                } else {
+                    char_offset = max_scroll;
+                }
+            }
+
+            int byte_off = utf8_byte_offset(files[idx].name, char_offset);
+            int copy_bytes = utf8_byte_offset(files[idx].name + byte_off, max_disp_len);
+            char disp_buf[256] = {0};
+            if (copy_bytes > 255) copy_bytes = 255;
+            strncpy(disp_buf, files[idx].name + byte_off, copy_bytes);
+            
+            int chars_copied = utf8_strlen(disp_buf);
+            mvprintw(i + 3, 2, "%s", disp_buf);
+            
+            // Pad space visually to erase ghosts
+            for (int p = chars_copied; p < max_disp_len; p++) {
+                printw(" ");
+            }
+
             if (idx == selected_file_idx) attroff(A_REVERSE | COLOR_PAIR(1));
             else if (files[idx].is_dir) attroff(COLOR_PAIR(3));
             else attroff(COLOR_PAIR(2));
