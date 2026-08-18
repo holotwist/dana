@@ -1,56 +1,22 @@
 #define _DEFAULT_SOURCE
 #define _XOPEN_SOURCE 600
 
+#include "audio.h"
+#include "state.h"
+#include "DANADecoder.h"
+#include "DANAUtility.h"
+
+#define MINIAUDIO_IMPLEMENTATION
+#include "thirdparty/miniaudio.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <time.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <stdatomic.h>
-#include <stdbool.h>
-#include <signal.h>
 
-#define MINIAUDIO_IMPLEMENTATION
-#include "thirdparty/miniaudio.h"
-
-#include "DANADecoder.h"
-#include "DANAUtility.h"
-
-#define SOCKET_PATH "/tmp/danaplayd.sock"
 #define BUFFER_CHUNK_SIZE 16384
-
-typedef enum {
-    STATE_STOPPED = 0,
-    STATE_PLAYING,
-    STATE_PAUSED
-} PlayState;
-
-typedef enum {
-    CMD_NONE,
-    CMD_PLAY,
-    CMD_PAUSE,
-    CMD_STOP,
-    CMD_QUIT,
-    CMD_SEEK
-} PlayerCommand;
-
-/* Global Playback State */
-static atomic_bool daemon_running = true;
-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static char playing_filepath[1024] = "";
-static atomic_int play_state_atomic = STATE_STOPPED;
-static atomic_int current_cmd_atomic = CMD_NONE;
-static atomic_int volume = 100;
-static atomic_int seek_target_sec = -1;
-
-static atomic_uint p_current_sec = 0;
-static atomic_uint p_total_sec = 0;
-static struct DANAHeaderInfo p_header = {0};
 
 typedef struct {
     FILE *fp;
@@ -60,6 +26,7 @@ typedef struct {
     int pending_append;
     struct { uint8_t *ptr; size_t size; size_t consumed; } allocs[256];
     int alloc_head, alloc_tail;
+    size_t total_bytes_read, total_consumed_bytes;
     DANAApiResult last_res;
     struct DANAHeaderInfo header;
 } StreamState;
@@ -88,6 +55,7 @@ static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput,
     if (framesReadTotal < frameCount) {
         memset(pOut, 0, (frameCount - framesReadTotal) * bpf);
     }
+    atomic_fetch_add(&p_frames_consumed, framesReadTotal);
 }
 
 static void init_stream_state(StreamState *ss, FILE *fp) {
@@ -118,6 +86,7 @@ static void feed_and_decode(StreamState *ss, int32_t **pcm_out, uint32_t out_max
             if (!chunk) break;
             bytes = fread(chunk, 1, BUFFER_CHUNK_SIZE, ss->fp);
             if (bytes == 0) { free(chunk); ss->pending_append = 0; break; }
+            ss->total_bytes_read += bytes;
         }
         if (DANAStreamingDecoder_AppendDataFragment(ss->decoder, chunk, (uint32_t)bytes) != DANA_APIRESULT_OK) {
             ss->pending_chunk = chunk; ss->pending_bytes = bytes; break;
@@ -128,11 +97,14 @@ static void feed_and_decode(StreamState *ss, int32_t **pcm_out, uint32_t out_max
 
     ss->last_res = DANAStreamingDecoder_Decode(ss->decoder, pcm_out, out_max, out_samples);
     if (ss->last_res != DANA_APIRESULT_OK && ss->last_res != DANA_APIRESULT_INSUFFICIENT_DATA_SIZE) {
+        if (ss->last_res == DANA_APIRESULT_DETECT_DATA_CORRUPTION) atomic_fetch_add(&p_discarded, 1);
+        else atomic_fetch_add(&p_dropped, 1);
         *exit_loop = 1;
     }
 
     const uint8_t *consumed_ptr; uint32_t consumed_size;
     while (DANAStreamingDecoder_CollectDataFragment(ss->decoder, &consumed_ptr, &consumed_size) == DANA_APIRESULT_OK) {
+        ss->total_consumed_bytes += consumed_size;
         if (consumed_size > 0 && ss->alloc_head != ss->alloc_tail) {
             ss->allocs[ss->alloc_head].consumed += consumed_size;
             if (ss->allocs[ss->alloc_head].consumed == ss->allocs[ss->alloc_head].size) {
@@ -142,24 +114,37 @@ static void feed_and_decode(StreamState *ss, int32_t **pcm_out, uint32_t out_max
     }
 }
 
-/* Audio Thread */
-static void *audio_thread_func(void *arg) {
+void *audio_thread_func(void *arg) {
     (void)arg;
-    struct timespec sleep_ts = {0, 50000000L}; // 50ms idle sleep
+    struct timespec sleep_ts = {0, 50000000L}; // 50ms
 
-    while (atomic_load(&daemon_running)) {
+    while (1) {
         PlayerCommand cmd = atomic_load(&current_cmd_atomic);
         char filepath[1024];
+        int this_file_idx = -1;
 
         if (cmd == CMD_PLAY) {
+            atomic_store(&header_ready_for_idx, -1);
             pthread_mutex_lock(&state_mutex);
             strncpy(filepath, playing_filepath, sizeof(filepath));
+            this_file_idx = playing_file_idx;
             pthread_mutex_unlock(&state_mutex);
             
             atomic_store(&current_cmd_atomic, CMD_NONE);
             atomic_store(&play_state_atomic, STATE_PLAYING);
-            atomic_store(&p_current_sec, 0);
+            
+            atomic_store(&p_decoded_blocks, 0); atomic_store(&p_played_buffers, 0);
+            atomic_store(&p_lost_buffers, 0); atomic_store(&p_media_data_size_kib, 0);
+            atomic_store(&p_input_bitrate_kbs, 0); atomic_store(&p_demuxed_data_size_kib, 0);
+            atomic_store(&p_content_bitrate_kbs, 0); atomic_store(&p_discarded, 0);
+            atomic_store(&p_dropped, 0); atomic_store(&p_current_sec, 0);
             atomic_store(&p_total_sec, 0);
+            
+            memset(vis_ring_l, 0, sizeof(vis_ring_l));
+            memset(vis_ring_r, 0, sizeof(vis_ring_r));
+            atomic_store(&vis_wpos, 0);
+            atomic_store(&vis_play_pos, 0);
+            atomic_store(&p_frames_consumed, 0);
         } else if (cmd == CMD_QUIT) {
             break;
         }
@@ -217,16 +202,20 @@ static void *audio_thread_func(void *arg) {
             }
         }
 
+        struct DANAMetadata old_metadata = {0};
         pthread_mutex_lock(&state_mutex);
-        DANAMetadata_Release(&p_header.metadata);
-        p_header = ss1.header;
-        memset(&ss1.header.metadata, 0, sizeof(struct DANAMetadata)); // transfer ownership
+        old_metadata = p_header.metadata;
+        p_header = ss1.header; 
+        memset(&ss1.header.metadata, 0, sizeof(struct DANAMetadata));
         pthread_mutex_unlock(&state_mutex);
+        DANAMetadata_Release(&old_metadata);
         
         atomic_store(&p_total_sec, (p_header.wave_format.sampling_rate > 0) ? p_header.num_samples / p_header.wave_format.sampling_rate : 0);
+        atomic_store(&vis_srate, p_header.wave_format.sampling_rate);
+        atomic_store(&header_ready_for_idx, this_file_idx);
 
         ma_pcm_rb ring_buffer;
-        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer); // 0.5 seconds buffer
+        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer);
         
         ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
         deviceConfig.playback.format   = ma_format_s32;
@@ -289,7 +278,7 @@ static void *audio_thread_func(void *arg) {
 
         while (samples_played < ss1.header.num_samples && !exit_loop) {
             cmd = atomic_load(&current_cmd_atomic);
-            if (cmd == CMD_STOP || cmd == CMD_PLAY || cmd == CMD_QUIT) {
+            if (cmd == CMD_STOP || cmd == CMD_NEXT || cmd == CMD_PREV || cmd == CMD_PLAY || cmd == CMD_QUIT) {
                 exit_loop = 1; break;
             }
             if (cmd == CMD_PAUSE) {
@@ -313,6 +302,8 @@ static void *audio_thread_func(void *arg) {
                         while (ss1.alloc_head != ss1.alloc_tail) { free(ss1.allocs[ss1.alloc_head].ptr); ss1.alloc_head = (ss1.alloc_head + 1) % 256; }
                         if (ss1.pending_chunk) { free(ss1.pending_chunk); ss1.pending_chunk = NULL; }
                         ss1.pending_append = 1;
+                        ss1.total_bytes_read = out_byte_offset;
+                        ss1.total_consumed_bytes = out_byte_offset;
 
                         if (hybrid_mode) {
                             DANAStreamingDecoder_Destroy(ss2.decoder);
@@ -322,16 +313,24 @@ static void *audio_thread_func(void *arg) {
                             while (ss2.alloc_head != ss2.alloc_tail) { free(ss2.allocs[ss2.alloc_head].ptr); ss2.alloc_head = (ss2.alloc_head + 1) % 256; }
                             if (ss2.pending_chunk) { free(ss2.pending_chunk); ss2.pending_chunk = NULL; }
                             ss2.pending_append = 1;
+                            ss2.total_bytes_read = out_byte_offset;
+                            ss2.total_consumed_bytes = out_byte_offset;
                         }
 
                         q1_len = 0;
                         if (hybrid_mode) q2_len = 0;
                         samples_played = out_sample;
-                        atomic_store(&p_current_sec, samples_played / ss1.header.wave_format.sampling_rate);
                         
+                        memset(vis_ring_l, 0, sizeof(vis_ring_l));
+                        memset(vis_ring_r, 0, sizeof(vis_ring_r));
+                        atomic_store(&vis_wpos, 0);
+                        atomic_store(&vis_play_pos, 0);
+
+                        atomic_store(&p_current_sec, samples_played / ss1.header.wave_format.sampling_rate);
                         ma_device_stop(&device);
                         ma_pcm_rb_uninit(&ring_buffer);
                         ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer);
+                        atomic_store(&p_frames_consumed, 0);
                         ma_device_start(&device);
                         device_active = true;
                     }
@@ -384,6 +383,24 @@ static void *audio_thread_func(void *arg) {
                         interleaved[s * ss1.header.wave_format.num_channels + c] = (int32_t)val64;
                     }
                 }
+                
+                uint32_t local_wpos = atomic_load(&vis_wpos);
+                for (uint32_t s = 0; s < mix_samples; s++) {
+                    float vl = 0.0f, vr = 0.0f;
+                    if (ss1.header.wave_format.num_channels == 1) {
+                        long long mixed = q1[0][s] + (hybrid_mode ? q2[0][s] : 0);
+                        vl = vr = (float)((mixed * current_vol) / 100) / 2147483648.0f;
+                    } else if (ss1.header.wave_format.num_channels >= 2) {
+                        long long mixed_l = q1[0][s] + (hybrid_mode ? q2[0][s] : 0);
+                        long long mixed_r = q1[1][s] + (hybrid_mode ? q2[1][s] : 0);
+                        vl = (float)((mixed_l * current_vol) / 100) / 2147483648.0f;
+                        vr = (float)((mixed_r * current_vol) / 100) / 2147483648.0f;
+                    }
+                    vis_ring_l[local_wpos & VIS_BUF_MASK] = vl;
+                    vis_ring_r[local_wpos & VIS_BUF_MASK] = vr;
+                    local_wpos++;
+                }
+                atomic_store(&vis_wpos, local_wpos);
 
                 uint32_t written = 0;
                 while (written < mix_samples && !exit_loop) {
@@ -403,6 +420,8 @@ static void *audio_thread_func(void *arg) {
                     }
                 }
 
+                atomic_store(&vis_play_pos, atomic_load(&p_frames_consumed));
+
                 for (uint32_t c = 0; c < ss1.header.wave_format.num_channels; c++) {
                     memmove(q1[c], q1[c] + mix_samples, (q1_len - mix_samples) * sizeof(int32_t));
                     if (hybrid_mode) memmove(q2[c], q2[c] + mix_samples, (q2_len - mix_samples) * sizeof(int32_t));
@@ -411,7 +430,16 @@ static void *audio_thread_func(void *arg) {
                 if (hybrid_mode) q2_len -= mix_samples;
 
                 samples_played += mix_samples;
-                atomic_store(&p_current_sec, samples_played / ss1.header.wave_format.sampling_rate);
+                uint32_t cur_sec = samples_played / ss1.header.wave_format.sampling_rate;
+                atomic_fetch_add(&p_decoded_blocks, 1); 
+                atomic_fetch_add(&p_played_buffers, 1);
+                atomic_store(&p_media_data_size_kib, (uint32_t)((ss1.total_bytes_read + (hybrid_mode ? ss2.total_bytes_read : 0)) / 1024));
+                atomic_store(&p_demuxed_data_size_kib, atomic_load(&p_media_data_size_kib));
+                if (cur_sec > 0) {
+                    atomic_store(&p_input_bitrate_kbs, (uint32_t)(((ss1.total_bytes_read + (hybrid_mode ? ss2.total_bytes_read : 0)) * 8) / cur_sec / 1000));
+                    atomic_store(&p_content_bitrate_kbs, (uint32_t)(((ss1.total_consumed_bytes + (hybrid_mode ? ss2.total_consumed_bytes : 0)) * 8) / cur_sec / 1000));
+                }
+                atomic_store(&p_current_sec, cur_sec);
             } else {
                 if (!ss1.pending_append && out_samples1 == 0) {
                     uint32_t remain; 
@@ -427,8 +455,12 @@ static void *audio_thread_func(void *arg) {
         if (hybrid_mode) free_stream_state(&ss2);
         
         for(uint32_t i=0; i < ss1.header.wave_format.num_channels; i++) {
-            free(pcm_out1[i]); free(q1[i]);
-            if (hybrid_mode) { free(pcm_out2[i]); free(q2[i]); }
+            free(pcm_out1[i]);
+            free(q1[i]);
+            if (hybrid_mode) {
+                free(pcm_out2[i]);
+                free(q2[i]);
+            }
         }
         free(pcm_out1); free(q1);
         if (hybrid_mode) { free(pcm_out2); free(q2); }
@@ -437,193 +469,11 @@ static void *audio_thread_func(void *arg) {
         cmd = atomic_load(&current_cmd_atomic);
         if (atomic_load(&play_state_atomic) == STATE_PLAYING && cmd == CMD_NONE) {
             atomic_store(&play_state_atomic, STATE_STOPPED);
+            atomic_store(&current_cmd_atomic, CMD_NEXT);
         } else if (cmd == CMD_STOP) {
             atomic_store(&play_state_atomic, STATE_STOPPED);
             atomic_store(&current_cmd_atomic, CMD_NONE);
         }
     }
     return NULL;
-}
-
-/* JSON helper */
-static void escape_json_string(const char *src, char *dest) {
-    if (!src) { *dest = 0; return; }
-    while (*src) {
-        if (*src == '"') { *dest++ = '\\'; *dest++ = '"'; }
-        else if (*src == '\\') { *dest++ = '\\'; *dest++ = '\\'; }
-        else if (*src == '\n') { *dest++ = '\\'; *dest++ = 'n'; }
-        else if (*src == '\r') { *dest++ = '\\'; *dest++ = 'r'; }
-        else if (*src == '\t') { *dest++ = '\\'; *dest++ = 't'; }
-        else { *dest++ = *src; }
-        src++;
-    }
-    *dest = 0;
-}
-
-/* Socket Listener */
-static void handle_client(int client_fd) {
-    char buf[2048];
-    memset(buf, 0, sizeof(buf));
-    int n = read(client_fd, buf, sizeof(buf) - 1);
-    if (n <= 0) return;
-
-    buf[strcspn(buf, "\r\n")] = 0; // Strip newline
-    
-    if (strncmp(buf, "play ", 5) == 0) {
-        pthread_mutex_lock(&state_mutex);
-        strncpy(playing_filepath, buf + 5, sizeof(playing_filepath) - 1);
-        pthread_mutex_unlock(&state_mutex);
-        atomic_store(&current_cmd_atomic, CMD_PLAY);
-        write(client_fd, "OK\n", 3);
-    } 
-    else if (strcmp(buf, "pause") == 0) {
-        atomic_store(&current_cmd_atomic, CMD_PAUSE);
-        write(client_fd, "OK\n", 3);
-    } 
-    else if (strcmp(buf, "stop") == 0) {
-        atomic_store(&current_cmd_atomic, CMD_STOP);
-        write(client_fd, "OK\n", 3);
-    } 
-    else if (strncmp(buf, "seek ", 5) == 0) {
-        int s = atoi(buf + 5);
-        if (s < 0) s = 0;
-        atomic_store(&seek_target_sec, s);
-        atomic_store(&current_cmd_atomic, CMD_SEEK);
-        write(client_fd, "OK\n", 3);
-    }
-    else if (strncmp(buf, "set_vol ", 8) == 0) {
-        int v = atoi(buf + 8);
-        if (v < 0) v = 0;
-        if (v > 200) v = 200;
-        atomic_store(&volume, v);
-        write(client_fd, "OK\n", 3);
-    } 
-    else if (strcmp(buf, "get_data") == 0) {
-        const char *state_str = "STOPPED";
-        PlayState s = atomic_load(&play_state_atomic);
-        if (s == STATE_PLAYING) state_str = "PLAYING";
-        else if (s == STATE_PAUSED) state_str = "PAUSED";
-        
-        char *resp = malloc(512 * 1024); // 512KB, maybe long lyrics?
-        char safe_file[1024]="", e_title[1024]="Unknown", e_art[1024]="Unknown";
-        char e_album[1024]="Unknown", e_year[256]="", e_genre[256]="";
-        char e_track[256]="", e_bpm[256]="", e_key[256]="";
-        char *e_lyrics = malloc(256 * 1024); e_lyrics[0] = 0;
-        int has_cover = 0;
-
-        pthread_mutex_lock(&state_mutex);
-        escape_json_string(playing_filepath, safe_file);
-        if (p_header.metadata.title) escape_json_string(p_header.metadata.title, e_title);
-        if (p_header.metadata.artist) escape_json_string(p_header.metadata.artist, e_art);
-        if (p_header.metadata.album) escape_json_string(p_header.metadata.album, e_album);
-        if (p_header.metadata.year) escape_json_string(p_header.metadata.year, e_year);
-        if (p_header.metadata.genre) escape_json_string(p_header.metadata.genre, e_genre);
-        if (p_header.metadata.track) escape_json_string(p_header.metadata.track, e_track);
-        if (p_header.metadata.bpm) escape_json_string(p_header.metadata.bpm, e_bpm);
-        if (p_header.metadata.key) escape_json_string(p_header.metadata.key, e_key);
-        if (p_header.metadata.lyrics) escape_json_string(p_header.metadata.lyrics, e_lyrics);
-        if (p_header.metadata.cover_data && p_header.metadata.cover_size > 0) has_cover = 1;
-        pthread_mutex_unlock(&state_mutex);
-
-        snprintf(resp, 512 * 1024, 
-            "{\"state\": \"%s\", \"file\": \"%s\", \"title\": \"%s\", \"artist\": \"%s\", "
-            "\"album\": \"%s\", \"year\": \"%s\", \"genre\": \"%s\", \"track\": \"%s\", "
-            "\"bpm\": \"%s\", \"key\": \"%s\", \"lyrics\": \"%s\", \"has_cover\": %s, "
-            "\"time\": %u, \"duration\": %u, \"volume\": %d}\n",
-            state_str, safe_file, e_title, e_art, e_album, e_year, e_genre, e_track, 
-            e_bpm, e_key, e_lyrics, has_cover ? "true" : "false",
-            atomic_load(&p_current_sec), atomic_load(&p_total_sec), atomic_load(&volume));
-            
-        write(client_fd, resp, strlen(resp));
-        free(resp); free(e_lyrics);
-    } 
-    else if (strcmp(buf, "get_cover") == 0) {
-        uint8_t *cover_buf = NULL;
-        uint32_t cover_size = 0;
-        
-        // Deep copy out of mutex to avoid freezing playback thread
-        pthread_mutex_lock(&state_mutex);
-        if (p_header.metadata.cover_data && p_header.metadata.cover_size > 0) {
-            cover_size = p_header.metadata.cover_size;
-            cover_buf = malloc(cover_size);
-            memcpy(cover_buf, p_header.metadata.cover_data, cover_size);
-        }
-        pthread_mutex_unlock(&state_mutex);
-
-        if (cover_buf) {
-            size_t total_written = 0;
-            while (total_written < cover_size) {
-                ssize_t w = write(client_fd, cover_buf + total_written, cover_size - total_written);
-                if (w <= 0) break; // Client disconnected / Broken pipe
-                total_written += w;
-            }
-            free(cover_buf);
-        } else {
-            write(client_fd, "NONE\n", 5);
-        }
-    }
-    else if (strcmp(buf, "quit") == 0) {
-        atomic_store(&daemon_running, false);
-        atomic_store(&current_cmd_atomic, CMD_QUIT);
-        write(client_fd, "SHUTTING DOWN\n", 14);
-    } 
-    else {
-        write(client_fd, "ERROR: UNKNOWN COMMAND\n", 23);
-    }
-}
-
-int main(void) {
-    printf("Starting Dana Playback Daemon...\n");
-    printf("Socket Path: %s\n", SOCKET_PATH);
-
-    // Trap signals for graceful shutdown and broken pipes
-    signal(SIGINT, SIG_IGN); 
-    signal(SIGTERM, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-
-    pthread_t audio_thread;
-    pthread_create(&audio_thread, NULL, audio_thread_func, NULL);
-
-    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("Socket creation failed");
-        return 1;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path)-1);
-
-    unlink(SOCKET_PATH);
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-        perror("Bind failed");
-        close(server_fd);
-        return 1;
-    }
-
-    if (listen(server_fd, 5) == -1) {
-        perror("Listen failed");
-        close(server_fd);
-        return 1;
-    }
-
-    printf("Daemon ready. Listening...\n");
-
-    while (atomic_load(&daemon_running)) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd >= 0) {
-            handle_client(client_fd);
-            close(client_fd);
-        }
-    }
-
-    printf("Daemon shutting down.\n");
-    close(server_fd);
-    unlink(SOCKET_PATH);
-    
-    pthread_join(audio_thread, NULL);
-    DANAMetadata_Release(&p_header.metadata);
-
-    return 0;
 }

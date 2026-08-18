@@ -39,7 +39,6 @@ add_library(dana_core STATIC
     src/DANAPredictor.c
     src/DANAUtility.c
     src/DANAEncoder.c
-    src/DANArANS.c
     src/command_line_parser.c
     src/wav.c
 )
@@ -53,8 +52,15 @@ target_link_libraries(dana_core m)
 add_executable(dana src/main.c)
 target_link_libraries(dana dana_core)
 
-add_executable(danaplay src/player.c)
-target_link_libraries(danaplay dana_core asound ncursesw pthread m)
+add_executable(danaplay
+    src/player/main.c
+    src/player/state.c
+    src/player/file_list.c
+    src/player/vis_math.c
+    src/player/audio.c
+    src/player/ui.c
+)
+target_link_libraries(danaplay dana_core ncursesw pthread m ${CMAKE_DL_LIBS})
 
 add_executable(danaplayd src/danaplayd.c)
-target_link_libraries(danaplayd dana_core asound pthread m)
+target_link_libraries(danaplayd dana_core pthread m ${CMAKE_DL_LIBS})
