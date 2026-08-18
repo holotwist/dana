@@ -145,7 +145,7 @@ Note: The decompressor automatically searches for the corresponding `.dahc` file
 
 ## The Player (`danaplay`)
 
-`danaplay` is a CLI-based player. It scans directories for `.dana` or `.dahl` files and outputs audio via ALSA.
+`danaplay` is a CLI-based player. It scans directories for `.dana` or `.dahl` files and outputs audio via MiniAudio.
 
 ```bash
 ./danaplay
