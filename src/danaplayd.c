@@ -10,10 +10,12 @@
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <alsa/asoundlib.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <signal.h>
+
+#define MINIAUDIO_IMPLEMENTATION
+#include "thirdparty/miniaudio.h"
 
 #include "DANADecoder.h"
 #include "DANAUtility.h"
@@ -62,8 +64,23 @@ typedef struct {
     struct DANAHeaderInfo header;
 } StreamState;
 
-static void silent_alsa_error_handler(const char *file, int line, const char *function, int err, const char *fmt, ...) {
-    (void)file; (void)line; (void)function; (void)err; (void)fmt;
+static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
+    (void)pInput;
+    ma_pcm_rb* pRingBuffer = (ma_pcm_rb*)pDevice->pUserData;
+    ma_uint32 framesRead = frameCount;
+    void* pReadBuffer;
+    
+    ma_pcm_rb_acquire_read(pRingBuffer, &framesRead, &pReadBuffer);
+    if (framesRead > 0) {
+        memcpy(pOutput, pReadBuffer, framesRead * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels));
+        ma_pcm_rb_commit_read(pRingBuffer, framesRead);
+    }
+    
+    // Fill the rest with silence if there's an underrun
+    if (framesRead < frameCount) {
+        ma_uint32 bytesToZero = (frameCount - framesRead) * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
+        memset((uint8_t*)pOutput + (framesRead * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels)), 0, bytesToZero);
+    }
 }
 
 static void init_stream_state(StreamState *ss, FILE *fp) {
@@ -201,12 +218,22 @@ static void *audio_thread_func(void *arg) {
         
         atomic_store(&p_total_sec, (p_header.wave_format.sampling_rate > 0) ? p_header.num_samples / p_header.wave_format.sampling_rate : 0);
 
-        snd_pcm_t *pcm_handle;
-        if (snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+        ma_pcm_rb ring_buffer;
+        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate * 2, NULL, NULL, &ring_buffer); // 2 seconds buffer
+        
+        ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
+        deviceConfig.playback.format   = ma_format_s32;
+        deviceConfig.playback.channels = p_header.wave_format.num_channels;
+        deviceConfig.sampleRate        = p_header.wave_format.sampling_rate;
+        deviceConfig.dataCallback      = data_callback;
+        deviceConfig.pUserData         = &ring_buffer;
+        
+        ma_device device;
+        if (ma_device_init(NULL, &deviceConfig, &device) != MA_SUCCESS) {
+            ma_pcm_rb_uninit(&ring_buffer);
             free_stream_state(&ss1); if(hybrid_mode) free_stream_state(&ss2); atomic_store(&play_state_atomic, STATE_STOPPED); continue;
         }
-        snd_pcm_set_params(pcm_handle, SND_PCM_FORMAT_S32_LE, SND_PCM_ACCESS_RW_INTERLEAVED,
-                           p_header.wave_format.num_channels, p_header.wave_format.sampling_rate, 1, 500000);
+        ma_device_start(&device);
 
         struct DANAStreamingDecoderConfig cfg = {
             .core_config = {
@@ -294,8 +321,10 @@ static void *audio_thread_func(void *arg) {
                         samples_played = out_sample;
                         atomic_store(&p_current_sec, samples_played / ss1.header.wave_format.sampling_rate);
                         
-                        snd_pcm_drop(pcm_handle);
-                        snd_pcm_prepare(pcm_handle);
+                        ma_device_stop(&device);
+                        ma_pcm_rb_uninit(&ring_buffer);
+                        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate * 2, NULL, NULL, &ring_buffer);
+                        ma_device_start(&device);
                     }
                 }
                 continue;
@@ -342,12 +371,19 @@ static void *audio_thread_func(void *arg) {
 
                 uint32_t written = 0;
                 while (written < mix_samples && !exit_loop) {
-                    snd_pcm_sframes_t frames = snd_pcm_writei(pcm_handle, interleaved + (written * ss1.header.wave_format.num_channels), mix_samples - written);
-                    if (frames < 0) {
-                        frames = snd_pcm_recover(pcm_handle, (int)frames, 0);
-                        if (frames < 0) exit_loop = 1;
-                    } else if (frames > 0) {
-                        written += (uint32_t)frames;
+                    ma_uint32 framesToWrite = mix_samples - written;
+                    void* pWriteBuffer;
+                    
+                    ma_pcm_rb_acquire_write(&ring_buffer, &framesToWrite, &pWriteBuffer);
+                    
+                    if (framesToWrite > 0) {
+                        memcpy(pWriteBuffer, interleaved + (written * ss1.header.wave_format.num_channels), 
+                               framesToWrite * sizeof(int32_t) * ss1.header.wave_format.num_channels);
+                        ma_pcm_rb_commit_write(&ring_buffer, framesToWrite);
+                        written += framesToWrite;
+                    } else {
+                        struct timespec sleep_ts_write = {0, 5000000L}; // 5ms sleep if full
+                        nanosleep(&sleep_ts_write, NULL);
                     }
                 }
 
@@ -369,8 +405,8 @@ static void *audio_thread_func(void *arg) {
             }
         }
         
-        snd_pcm_drain(pcm_handle);
-        snd_pcm_close(pcm_handle);
+        ma_device_uninit(&device);
+        ma_pcm_rb_uninit(&ring_buffer);
         free_stream_state(&ss1);
         if (hybrid_mode) free_stream_state(&ss2);
         
@@ -528,7 +564,6 @@ int main(void) {
     signal(SIGINT, SIG_IGN); 
     signal(SIGTERM, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
-    snd_lib_error_set_handler(silent_alsa_error_handler);
 
     pthread_t audio_thread;
     pthread_create(&audio_thread, NULL, audio_thread_func, NULL);
