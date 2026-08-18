@@ -94,6 +94,7 @@ static float       vis_ring_r[VIS_BUF_SIZE] = {0};
 static atomic_uint vis_wpos     = 0;   
 static atomic_uint vis_play_pos = 0;   
 static atomic_uint vis_srate    = 44100;
+static atomic_uint p_frames_consumed = 0;
 
 typedef struct {
     FILE *fp;
@@ -162,19 +163,28 @@ static void draw_braille_line(uint8_t *grid, int draw_w, int draw_h, int x0, int
 static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     (void)pInput;
     ma_pcm_rb* pRingBuffer = (ma_pcm_rb*)pDevice->pUserData;
-    ma_uint32 framesRead = frameCount;
-    void* pReadBuffer;
-    
-    ma_pcm_rb_acquire_read(pRingBuffer, &framesRead, &pReadBuffer);
-    if (framesRead > 0) {
-        memcpy(pOutput, pReadBuffer, framesRead * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels));
-        ma_pcm_rb_commit_read(pRingBuffer, framesRead);
+    ma_uint32 framesReadTotal = 0;
+    ma_uint32 bpf = ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
+    uint8_t* pOut = (uint8_t*)pOutput;
+
+    while (framesReadTotal < frameCount) {
+        ma_uint32 framesToRead = frameCount - framesReadTotal;
+        void* pReadBuffer;
+        
+        ma_pcm_rb_acquire_read(pRingBuffer, &framesToRead, &pReadBuffer);
+        if (framesToRead == 0) break;
+        
+        memcpy(pOut, pReadBuffer, framesToRead * bpf);
+        ma_pcm_rb_commit_read(pRingBuffer, framesToRead);
+        
+        pOut += framesToRead * bpf;
+        framesReadTotal += framesToRead;
     }
     
-    if (framesRead < frameCount) {
-        ma_uint32 bytesToZero = (frameCount - framesRead) * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
-        memset((uint8_t*)pOutput + (framesRead * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels)), 0, bytesToZero);
+    if (framesReadTotal < frameCount) {
+        memset(pOut, 0, (frameCount - framesReadTotal) * bpf);
     }
+    atomic_fetch_add(&p_frames_consumed, frameCount);
 }
 
 static int file_cmp(const void *a, const void *b) {
@@ -300,10 +310,12 @@ static void *audio_thread_func(void *arg) {
             atomic_store(&p_dropped, 0); atomic_store(&p_current_sec, 0);
             atomic_store(&p_total_sec, 0);
             
+            // Reset tracker on play
             memset(vis_ring_l, 0, sizeof(vis_ring_l));
             memset(vis_ring_r, 0, sizeof(vis_ring_r));
             atomic_store(&vis_wpos, 0);
             atomic_store(&vis_play_pos, 0);
+            atomic_store(&p_frames_consumed, 0);
         } else if (cmd == CMD_QUIT) {
             break;
         }
@@ -375,7 +387,7 @@ static void *audio_thread_func(void *arg) {
         atomic_store(&header_ready_for_idx, this_file_idx);
 
         ma_pcm_rb ring_buffer;
-        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate * 2, NULL, NULL, &ring_buffer);
+        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer);
         
         ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
         deviceConfig.playback.format   = ma_format_s32;
@@ -390,6 +402,7 @@ static void *audio_thread_func(void *arg) {
             free_stream_state(&ss1); if(hybrid_mode) free_stream_state(&ss2); atomic_store(&play_state_atomic, STATE_STOPPED); continue;
         }
         ma_device_start(&device);
+        bool device_active = true;
 
         struct DANAStreamingDecoderConfig cfg = {
             .core_config = {
@@ -488,14 +501,23 @@ static void *audio_thread_func(void *arg) {
                         atomic_store(&p_current_sec, samples_played / ss1.header.wave_format.sampling_rate);
                         ma_device_stop(&device);
                         ma_pcm_rb_uninit(&ring_buffer);
-                        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate * 2, NULL, NULL, &ring_buffer);
+                        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer);
+                        atomic_store(&p_frames_consumed, 0);
                         ma_device_start(&device);
+                        device_active = true;
                     }
                 }
                 continue;
             }
             if (atomic_load(&play_state_atomic) == STATE_PAUSED) {
+                if (device_active) {
+                    ma_device_stop(&device);
+                    device_active = false;
+                }
                 nanosleep(&sleep_ts, NULL); continue;
+            } else if (!device_active) {
+                ma_device_start(&device);
+                device_active = true;
             }
             
             uint32_t out_samples1 = 0;
@@ -570,9 +592,7 @@ static void *audio_thread_func(void *arg) {
                     }
                 }
 
-                ma_uint32 delay = ma_pcm_rb_available_read(&ring_buffer);
-                if (local_wpos > delay) atomic_store(&vis_play_pos, local_wpos - delay);
-                else atomic_store(&vis_play_pos, 0);
+                atomic_store(&vis_play_pos, atomic_load(&p_frames_consumed));
 
                 for (uint32_t c = 0; c < ss1.header.wave_format.num_channels; c++) {
                     memmove(q1[c], q1[c] + mix_samples, (q1_len - mix_samples) * sizeof(int32_t));

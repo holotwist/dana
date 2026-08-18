@@ -67,19 +67,26 @@ typedef struct {
 static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     (void)pInput;
     ma_pcm_rb* pRingBuffer = (ma_pcm_rb*)pDevice->pUserData;
-    ma_uint32 framesRead = frameCount;
-    void* pReadBuffer;
-    
-    ma_pcm_rb_acquire_read(pRingBuffer, &framesRead, &pReadBuffer);
-    if (framesRead > 0) {
-        memcpy(pOutput, pReadBuffer, framesRead * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels));
-        ma_pcm_rb_commit_read(pRingBuffer, framesRead);
+    ma_uint32 framesReadTotal = 0;
+    ma_uint32 bpf = ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
+    uint8_t* pOut = (uint8_t*)pOutput;
+
+    while (framesReadTotal < frameCount) {
+        ma_uint32 framesToRead = frameCount - framesReadTotal;
+        void* pReadBuffer;
+        
+        ma_pcm_rb_acquire_read(pRingBuffer, &framesToRead, &pReadBuffer);
+        if (framesToRead == 0) break;
+        
+        memcpy(pOut, pReadBuffer, framesToRead * bpf);
+        ma_pcm_rb_commit_read(pRingBuffer, framesToRead);
+        
+        pOut += framesToRead * bpf;
+        framesReadTotal += framesToRead;
     }
     
-    // Fill the rest with silence if there's an underrun
-    if (framesRead < frameCount) {
-        ma_uint32 bytesToZero = (frameCount - framesRead) * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
-        memset((uint8_t*)pOutput + (framesRead * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels)), 0, bytesToZero);
+    if (framesReadTotal < frameCount) {
+        memset(pOut, 0, (frameCount - framesReadTotal) * bpf);
     }
 }
 
@@ -219,7 +226,7 @@ static void *audio_thread_func(void *arg) {
         atomic_store(&p_total_sec, (p_header.wave_format.sampling_rate > 0) ? p_header.num_samples / p_header.wave_format.sampling_rate : 0);
 
         ma_pcm_rb ring_buffer;
-        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate * 2, NULL, NULL, &ring_buffer); // 2 seconds buffer
+        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer); // 0.5 seconds buffer
         
         ma_device_config deviceConfig = ma_device_config_init(ma_device_type_playback);
         deviceConfig.playback.format   = ma_format_s32;
@@ -234,6 +241,7 @@ static void *audio_thread_func(void *arg) {
             free_stream_state(&ss1); if(hybrid_mode) free_stream_state(&ss2); atomic_store(&play_state_atomic, STATE_STOPPED); continue;
         }
         ma_device_start(&device);
+        bool device_active = true;
 
         struct DANAStreamingDecoderConfig cfg = {
             .core_config = {
@@ -323,14 +331,22 @@ static void *audio_thread_func(void *arg) {
                         
                         ma_device_stop(&device);
                         ma_pcm_rb_uninit(&ring_buffer);
-                        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate * 2, NULL, NULL, &ring_buffer);
+                        ma_pcm_rb_init(ma_format_s32, p_header.wave_format.num_channels, p_header.wave_format.sampling_rate / 2, NULL, NULL, &ring_buffer);
                         ma_device_start(&device);
+                        device_active = true;
                     }
                 }
                 continue;
             }
             if (atomic_load(&play_state_atomic) == STATE_PAUSED) {
+                if (device_active) {
+                    ma_device_stop(&device);
+                    device_active = false;
+                }
                 nanosleep(&sleep_ts, NULL); continue;
+            } else if (!device_active) {
+                ma_device_start(&device);
+                device_active = true;
             }
             
             uint32_t out_samples1 = 0;
