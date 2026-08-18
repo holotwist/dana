@@ -1,4 +1,5 @@
 #include "ui_common.h"
+#include "ui_animations.h"
 #include <math.h>
 
 void draw_player_panel(int y, int x, int h, int w) {
@@ -111,9 +112,18 @@ void draw_player_panel(int y, int x, int h, int w) {
 
     // Title
     if (title_y != -1) {
-        int text_len = utf8_strlen(ui_cache.filename);
-        int txt_start = center_x - (text_len / 2);
-        if (txt_start < x + 2) txt_start = x + 2;
-        mvprintw(title_y, txt_start, "%.*s", w - 4, (playing_file_idx >= 0) ? ui_cache.filename : "<No Song Selected>");
+        int max_title_w = w - 4;
+        if (max_title_w > 0) {
+            const char *filename_to_show = (playing_file_idx >= 0) ? ui_cache.filename : "<No Song Selected>";
+            char disp_buf[256] = {0};
+            get_marquee_text(filename_to_show, max_title_w, ui_frame_counter, disp_buf, sizeof(disp_buf));
+            
+            int text_len = utf8_strlen(disp_buf);
+            int txt_start = center_x - (text_len / 2);
+            if (txt_start < x + 2) txt_start = x + 2;
+            
+            mvhline(title_y, x + 2, ' ', max_title_w); // Clear line to prevent ghost characters
+            mvprintw(title_y, txt_start, "%s", disp_buf);
+        }
     }
 }

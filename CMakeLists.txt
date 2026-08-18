@@ -59,6 +59,7 @@ add_executable(danaplay
     src/player/vis_math.c
     src/player/audio.c
     src/player/ui_common.c
+    src/player/ui_animations.c
     src/player/ui_files.c
     src/player/ui_info.c
     src/player/ui_vis.c

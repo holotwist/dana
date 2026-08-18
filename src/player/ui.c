@@ -43,6 +43,12 @@ static void ui_update_state(void) {
     }
     pthread_mutex_unlock(&state_mutex);
 
+    // Auto-switch away from lyrics tab if lyrics aren't available
+    if (active_tab == 3 && ui_cache.meta.lyrics == NULL) {
+        active_tab = 1;
+        force_redraw = true;
+    }
+
     uint32_t target_play_pos = atomic_load(&vis_play_pos);
     uint32_t srate = atomic_load(&vis_srate);
     if (srate == 0) srate = 44100;
@@ -159,7 +165,7 @@ void ui_run(void) {
             case 'b': case '<': atomic_store(&current_cmd_atomic, CMD_PREV); break;
             case '1': active_tab = 1; break;
             case '2': active_tab = 2; break;
-            case '3': active_tab = 3; break;
+            case '3': if (ui_cache.meta.lyrics != NULL) active_tab = 3; break;
             case 'c': case 'C': if (active_tab == 1) current_vis_mode = (current_vis_mode + 1) % 2; break;
             case 'f': case 'F': is_fullscreen = !is_fullscreen; break;
             case '+': case '=': if (atomic_load(&volume) < 200) atomic_fetch_add(&volume, 5); break;

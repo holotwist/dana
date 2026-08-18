@@ -16,7 +16,9 @@ void draw_vis_panel(int y, int x, int h, int w) {
     
     attron(active_tab == 2 ? A_REVERSE : A_NORMAL); printw("2:Codec info"); attroff(active_tab == 2 ? A_REVERSE : A_NORMAL); printw(" ");
     
-    attron(active_tab == 3 ? A_REVERSE : A_NORMAL); printw("3:lyric"); attroff(active_tab == 3 ? A_REVERSE : A_NORMAL);
+    if (ui_cache.meta.lyrics != NULL) {
+        attron(active_tab == 3 ? A_REVERSE : A_NORMAL); printw("3:lyric"); attroff(active_tab == 3 ? A_REVERSE : A_NORMAL); printw(" ");
+    }
     printw(" -["); attron(COLOR_PAIR(5)); printw("C:Switch Visualizer"); attroff(COLOR_PAIR(5)); printw("] ");
     printw("-["); attron(COLOR_PAIR(5)); printw(is_fullscreen ? "F:Windowed" : "F:Fullscreen"); attroff(COLOR_PAIR(5)); printw("] ");
 
