@@ -24,7 +24,7 @@ To compile and run all components of Dana, your system requires:
 - **Compiler**: A C11-compliant compiler (GCC or Clang recommended)
 - **Build System**: CMake (version 3.16 or higher)
 - **Libraries**:
-  - **ALSA** (Advanced Linux Sound Architecture) for audio output, or PipeWire with ALSA support
+  - ~~**ALSA** (Advanced Linux Sound Architecture) for audio output, or PipeWire with ALSA support~~
   - **Ncurses with Wide Character Support** for the player interface
 
 ---
