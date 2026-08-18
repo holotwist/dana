@@ -184,7 +184,8 @@ static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput,
     if (framesReadTotal < frameCount) {
         memset(pOut, 0, (frameCount - framesReadTotal) * bpf);
     }
-    atomic_fetch_add(&p_frames_consumed, frameCount);
+    // Only track frames actually read from the buffer to prevent visualizer desync on underruns
+    atomic_fetch_add(&p_frames_consumed, framesReadTotal);
 }
 
 static int file_cmp(const void *a, const void *b) {
@@ -811,7 +812,10 @@ static void ui_loop(void) {
                 for (int i = 0; i < FFT_SIZE; i++) {
                     uint32_t idx = (smooth_rpos + VIS_BUF_SIZE - FFT_SIZE + i) & VIS_BUF_MASK;
                     float hann = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (FFT_SIZE - 1)));
-                    X[i] = (vis_ring_l[idx] + vis_ring_r[idx]) * 0.5f * hann;
+                    float val = (vis_ring_l[idx] + vis_ring_r[idx]) * 0.5f * hann;
+                    // Anti-denormal clamping
+                    if (fabsf(val) < 1e-15f) val = 0.0f;
+                    X[i] = val;
                 }
                 compute_fft(X, FFT_SIZE);
                 float min_f = log10f(1.0f); float max_f = log10f((float)(FFT_SIZE / 2));
