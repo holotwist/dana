@@ -115,7 +115,7 @@ void draw_player_panel(int y, int x, int h, int w) {
         int max_title_w = w - 4;
         if (max_title_w > 0) {
             const char *filename_to_show = (playing_file_idx >= 0) ? ui_cache.filename : "<No Song Selected>";
-            char disp_buf[256] = {0};
+            char disp_buf[1024] = {0};
             get_marquee_text(filename_to_show, max_title_w, ui_frame_counter, disp_buf, sizeof(disp_buf));
             
             int text_len = utf8_display_width(disp_buf);

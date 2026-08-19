@@ -18,7 +18,19 @@ void draw_files_panel(int y, int x, int h, int w) {
         }
     }
 
-    mvprintw(y + 1, x + 1, " %s", current_dir);
+    int max_path_width = w - 3;
+    if (max_path_width > 0) {
+        int path_width = utf8_display_width(current_dir);
+        if (path_width <= max_path_width) {
+            mvprintw(y + 1, x + 1, " %s", current_dir);
+        } else if (max_path_width > 3) {
+            int offset = utf8_byte_offset_for_suffix(current_dir, max_path_width - 3);
+            mvprintw(y + 1, x + 1, " ...%s", current_dir + offset);
+        } else {
+            mvprintw(y + 1, x + 1, " ...");
+        }
+    }
+    
     attron(COLOR_PAIR(4)); 
     mvhline(y + 2, x + 1, ACS_HLINE, w - 2); 
     attroff(COLOR_PAIR(4));
@@ -40,7 +52,7 @@ void draw_files_panel(int y, int x, int h, int w) {
         else if (files[idx].is_dir) attron(COLOR_PAIR(3));
         else attron(COLOR_PAIR(2));
         
-        char disp_buf[256] = {0};
+        char disp_buf[1024] = {0};
         if (idx == selected_file_idx) {
             get_marquee_text(files[idx].name, max_disp_len, ui_frame_counter, disp_buf, sizeof(disp_buf));
         } else {
