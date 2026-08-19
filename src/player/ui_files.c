@@ -47,7 +47,7 @@ void draw_files_panel(int y, int x, int h, int w) {
             get_marquee_text(files[idx].name, max_disp_len, 0, disp_buf, sizeof(disp_buf));
         }
         
-        int chars_copied = utf8_strlen(disp_buf);
+        int chars_copied = utf8_display_width(disp_buf);
         mvprintw(y + i + 3, x + 2, "%s", disp_buf);
         
         for (int p = chars_copied; p < max_disp_len; p++) printw(" ");

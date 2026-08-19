@@ -23,8 +23,8 @@ extern UICache ui_cache;
 
 // Utility functions
 void ui_draw_box(int y, int x, int h, int w, const char* title, int color_pair);
-int utf8_strlen(const char *str);
-int utf8_byte_offset(const char *str, int char_offset);
+int utf8_display_width(const char *str);
+int utf8_byte_offset_for_width(const char *str, int target_width);
 
 // Component draw functions
 void draw_files_panel(int y, int x, int h, int w);

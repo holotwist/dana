@@ -118,7 +118,7 @@ void draw_player_panel(int y, int x, int h, int w) {
             char disp_buf[256] = {0};
             get_marquee_text(filename_to_show, max_title_w, ui_frame_counter, disp_buf, sizeof(disp_buf));
             
-            int text_len = utf8_strlen(disp_buf);
+            int text_len = utf8_display_width(disp_buf);
             int txt_start = center_x - (text_len / 2);
             if (txt_start < x + 2) txt_start = x + 2;
             

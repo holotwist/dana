@@ -1,32 +1,54 @@
+#define _DEFAULT_SOURCE
+#define _XOPEN_SOURCE 600
+
 #include "ui_common.h"
+#include <wchar.h>
+#include <stdlib.h>
 
 unsigned long ui_frame_counter = 0;
 int ui_last_selected_idx = -1;
 UICache ui_cache = { .idx = -2, .header_loaded_for_idx = -2 };
 
-int utf8_strlen(const char *str) {
-    int len = 0;
-    for (int i = 0; str[i] != '\0'; ) {
-        unsigned char c = (unsigned char)str[i];
-        if ((c & 0x80) == 0) i += 1;
-        else if ((c & 0xE0) == 0xC0) i += 2;
-        else if ((c & 0xF0) == 0xE0) i += 3;
-        else if ((c & 0xF8) == 0xF0) i += 4;
-        else i += 1; 
-        len++;
+int utf8_display_width(const char *str) {
+    if (!str) return 0;
+    int width = 0;
+    mbstate_t state = {0};
+    const char *p = str;
+    while (*p != '\0') {
+        wchar_t wc;
+        size_t len = mbrtowc(&wc, p, MB_CUR_MAX, &state);
+        if (len == (size_t)-1 || len == (size_t)-2 || len == 0) {
+            if (len == (size_t)-1 || len == (size_t)-2) p++;
+            else break;
+            continue;
+        }
+        int w = wcwidth(wc);
+        if (w > 0) width += w;
+        p += len;
     }
-    return len;
+    return width;
 }
 
-int utf8_byte_offset(const char *str, int char_offset) {
+int utf8_byte_offset_for_width(const char *str, int target_width) {
+    if (!str) return 0;
+    int current_width = 0;
     int byte_offset = 0;
-    for (int i = 0; i < char_offset && str[byte_offset] != '\0'; i++) {
-        unsigned char c = (unsigned char)str[byte_offset];
-        if ((c & 0x80) == 0) byte_offset += 1;
-        else if ((c & 0xE0) == 0xC0) byte_offset += 2;
-        else if ((c & 0xF0) == 0xE0) byte_offset += 3;
-        else if ((c & 0xF8) == 0xF0) byte_offset += 4;
-        else byte_offset += 1; 
+    mbstate_t state = {0};
+    const char *p = str;
+    while (*p != '\0') {
+        wchar_t wc;
+        size_t len = mbrtowc(&wc, p, MB_CUR_MAX, &state);
+        if (len == (size_t)-1 || len == (size_t)-2 || len == 0) {
+            if (len == (size_t)-1 || len == (size_t)-2) { p++; byte_offset++; }
+            else break;
+            continue;
+        }
+        int w = wcwidth(wc);
+        if (w < 0) w = 0;
+        if (current_width + w > target_width) break;
+        current_width += w;
+        p += len;
+        byte_offset += len;
     }
     return byte_offset;
 }

@@ -85,12 +85,16 @@ static void ui_loop(void) {
         int files_h = max_y * 30 / 100;
         int bottom_h = max_y - vis_h - files_h;
         
-        int info_w = max_x * 35 / 100;
+        // If the screen is too narrow, hide the info panel entirely
+        int info_w = (max_x < 65) ? 0 : (max_x * 35 / 100);
         int player_w = max_x - info_w;
 
         draw_vis_panel(0, 0, vis_h, max_x);
         draw_files_panel(vis_h, 0, files_h, max_x);
-        draw_info_panel(vis_h + files_h, 0, bottom_h, info_w);
+        
+        if (info_w > 0) {
+            draw_info_panel(vis_h + files_h, 0, bottom_h, info_w);
+        }
         draw_player_panel(vis_h + files_h, info_w, bottom_h, player_w);
     } else {
         // Horizontal Split Structure
