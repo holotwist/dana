@@ -58,6 +58,12 @@ add_executable(danaplay
     src/player/file_list.c
     src/player/vis_math.c
     src/player/audio.c
+    src/player/ui_common.c
+    src/player/ui_animations.c
+    src/player/ui_files.c
+    src/player/ui_info.c
+    src/player/ui_vis.c
+    src/player/ui_player.c
     src/player/ui.c
 )
 target_link_libraries(danaplay dana_core ncursesw pthread m ${CMAKE_DL_LIBS})
