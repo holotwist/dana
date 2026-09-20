@@ -74,7 +74,12 @@ install(TARGETS dana
     COMPONENT essential
 )
 
-install(TARGETS danaplay danaplayd
+install(TARGETS danaplay
+    RUNTIME DESTINATION bin
+    COMPONENT extras
+)
+
+install(TARGETS danaplayd
     RUNTIME DESTINATION bin
     COMPONENT extras
 )
