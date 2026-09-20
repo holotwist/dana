@@ -29,22 +29,59 @@ To compile and run all components of Dana, your system requires:
 
 ---
 
-## Compilation
+## Compilation & Installation
 
+The project includes an automated `build.sh` script supporting optimization tuning, installation, uninstallation, and release packaging.
+
+### Quick Build (Native Hardware)
 ```bash
-cd dana
-
-mkdir build
-cd build
-
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+./build.sh
 ```
 
-Upon compilation, three executable files will be created in the build directory:
-- `dana`: Command-line tool for encoding and decoding.
-- `danaplay`: The player.
-- `danaplayd`: Playback daemon.
+### Build Script Options
+```text
+Usage: ./build.sh [OPTIONS]
+
+Build Options:
+  -r, --release               Build in Release mode (-O3, default)
+  -d, --debug                 Build in Debug mode (-g)
+  -c, --clean                 Wipe build directory before building
+  -m, --modern                Build for modern x86_64 baseline (x86-64-v3: AVX2/FMA/BMI2)
+  -l, --level <level>         Specify x86_64 level (x86-64-v2, x86-64-v3, x86-64-v4)
+      --portable              Build generic binary without native hardware flags
+
+Installation Options:
+      --install               Build and install all binaries (dana, danaplay, danaplayd)
+      --install-essential     Build and install only the core 'dana' CLI binary
+      --uninstall             Remove installed binaries using install manifest
+      --prefix <dir>          Installation prefix (default: /usr/local)
+
+Packaging:
+  -p, --package [ver]         Bundle release binaries into dist/*.tar.gz with SHA-256
+```
+
+### Installation Examples
+
+**Install only the core CLI encoder/decoder (`dana`):**
+```bash
+./build.sh --install-essential
+```
+
+**Install all tools to `/usr/local/bin`:**
+```bash
+./build.sh --install
+```
+
+**Cleanly uninstall:**
+```bash
+./build.sh --uninstall
+```
+
+### Manual CMake Build (Alternative)
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
 
 ---
 
