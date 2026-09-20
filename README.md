@@ -29,22 +29,59 @@ To compile and run all components of Dana, your system requires:
 
 ---
 
-## Compilation
+## Compilation & Installation
 
+The project includes an automated `build.sh` script supporting optimization tuning, installation, uninstallation, and release packaging.
+
+### Quick Build (Native Hardware)
 ```bash
-cd dana
-
-mkdir build
-cd build
-
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+./build.sh
 ```
 
-Upon compilation, three executable files will be created in the build directory:
-- `dana`: Command-line tool for encoding and decoding.
-- `danaplay`: The player.
-- `danaplayd`: Playback daemon.
+### Build Script Options
+```text
+Usage: ./build.sh [OPTIONS]
+
+Build Options:
+  -r, --release               Build in Release mode (-O3, default)
+  -d, --debug                 Build in Debug mode (-g)
+  -c, --clean                 Wipe build directory before building
+  -m, --modern                Build for modern x86_64 baseline (x86-64-v3: AVX2/FMA/BMI2)
+  -l, --level <level>         Specify x86_64 level (x86-64-v2, x86-64-v3, x86-64-v4)
+      --portable              Build generic binary without native hardware flags
+
+Installation Options:
+      --install               Build and install all binaries (dana, danaplay, danaplayd)
+      --install-essential     Build and install only the core 'dana' CLI binary
+      --uninstall             Remove installed binaries using install manifest
+      --prefix <dir>          Installation prefix (default: /usr/local)
+
+Packaging:
+  -p, --package [ver]         Bundle release binaries into dist/*.tar.gz with SHA-256
+```
+
+### Installation Examples
+
+**Install only the core CLI encoder/decoder (`dana`):**
+```bash
+./build.sh --install-essential
+```
+
+**Install all tools to `/usr/local/bin`:**
+```bash
+./build.sh --install
+```
+
+**Cleanly uninstall:**
+```bash
+./build.sh --uninstall
+```
+
+### Manual CMake Build (Alternative)
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
 
 ---
 
@@ -58,12 +95,13 @@ The main tool handles both encoding WAV files into DANA files and decoding them 
 ```
 
 ### General Options
-- `-h, --help`: Show the command help message.
+- `-h, --help`: Show command help message.
 - `-v, --version`: Show version details.
 - `-e, --encode`: Encode.
 - `-d, --decode`: Decode.
-- `-p, --verpose`: Enable verbose mode. *Note: The CLI option uses the exact spelling `--verpose`.*
-- `-q, --quiet`: Run in quiet mode.
+- `-t, --threads <num>`: Limit worker thread count (default: auto-detect all CPU cores).
+- `-p, --verpose`: Enable verbose mode.(displays stream info and completion status to `stderr`). *Note: The CLI option uses the exact spelling `--verpose`.*
+- `-q, --quiet`: Quiet mode (suppresses all console output; errors only).
 
 ---
 
@@ -74,6 +112,7 @@ When encoding (`-e`), you can configure the compression behavior and embed metad
 | Option | Argument | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `-m, --mode` | `0` to `4` | Compression preset (0 = fastest decode, 4 = highest compression). | `2` |
+| `-t, --threads` | `<num>` | Worker threads limit. | Auto |
 | `-z, --seek-table` | `yes` or `no` | Generate and embed a seek table inside the header. | `yes` |
 | `-x, --hybrid` | `<shift>` | Enable Hybrid mode. Specifies the bit-shift value (e.g., `6`) to output lossy `.dahl` and correction `.dahc` files. | Disabled |
 
@@ -91,6 +130,16 @@ When encoding (`-e`), you can configure the compression behavior and embed metad
 
 #### Encoding Examples:
 
+**Fastest Multicore Compression:**
+```bash
+dana -e -m 0 input.wav output.dana
+```
+
+**Maximum Compression using 4 Threads:**
+```bash
+dana -e -m 4 -t 4 input.wav output.dana
+```
+
 **Basic Lossless Encode (Preset 3 with Seek Table)**
 ```bash
 ./dana -e -m 3 -z yes input.wav output.dana
@@ -105,6 +154,14 @@ When encoding (`-e`), you can configure the compression behavior and embed metad
   --lyrics "Hello\nWorld" \
   --cover "./artwork.jpg" \
   input.wav output.dana
+```
+
+**UNIX Pipe Streaming (stdin to stdout):**
+```bash
+cat input.wav | dana -e -m 0 - - > output.dana
+
+# Transcode from FFmpeg pipe:
+ffmpeg -i track.flac -f wav - | dana -e -m 0 - output.dana
 ```
 
 **Hybrid Mode Encode**
@@ -124,14 +181,23 @@ When decoding (`-d`), the output format is determined by your destination file n
 
 | Option | Argument | Description | Default |
 | :--- | :--- | :--- | :--- |
+| `-t, --threads` | `<num>` | Worker threads limit. | Auto |
 | `-c, --crc-check` | `yes` or `no` | Validate data integrity block-by-block using CRC16 during decompression. | `yes` |
 | `-s, --streaming`| None | Debug option to test the streaming decompressor framework at 120Hz. | Off |
 
 #### Decoding Examples:
 
-**Standard Lossless Decode**
+**Standard Decode**
 ```bash
 ./dana -d input.dana output.wav
+```
+
+**UNIX Pipe Decompression:**
+```bash
+cat input.dana | dana -d - - > restored.wav
+
+# Direct pipe playback via aplay:
+dana -d input.dana - | aplay
 ```
 
 **Hybrid Mode Lossless Reconstruction**
@@ -207,3 +273,11 @@ echo "get_cover" | nc -U /tmp/danaplayd.sock > cover.jpg
 
 # Stop/kill the daemon
 echo "quit" | nc -U /tmp/danaplayd.sock
+
+---
+
+## License & Attributions
+
+Dana is licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for details.
+
+Third-party software attributions and acknowledgments are documented in [NOTICE.txt](NOTICE.txt)
