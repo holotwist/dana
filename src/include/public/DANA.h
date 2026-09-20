@@ -80,6 +80,7 @@ struct DANAEncodeParameter {
     DANAChannelProcessMethod ch_process_method;
     DANAWindowFunctionType window_function_type;
     uint32_t max_num_block_samples;
+    uint32_t search_mode; // 0: fast, 1: medium, 2: deep
 };
 
 struct DANAHeaderInfo {

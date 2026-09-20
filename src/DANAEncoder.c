@@ -10,6 +10,9 @@
 #include <math.h>
 #include <string.h>
 #include <float.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
 #define DANAENCODER_STATUS_FLAG_SET_WAVE_FORMAT      (1 << 0)
 #define DANAENCODER_STATUS_FLAG_SET_ENCODE_PARAMETER (1 << 1)
@@ -71,6 +74,7 @@ struct DANAEncoder {
     uint8_t                        lms_num_stages[DANA_MAX_CHANNELS];
     uint8_t                        lms_step_idx[DANA_MAX_CHANNELS][DANA_MAX_LMS_STAGES];
     uint8_t                        enable_seek_table;
+    uint32_t                       num_threads;
 };
 
 struct DANAEncoder* DANAEncoder_Create(const struct DANAEncoderConfig* config) {
@@ -81,6 +85,7 @@ struct DANAEncoder* DANAEncoder_Create(const struct DANAEncoderConfig* config) {
 
     encoder->max_num_channels         = config->max_num_channels;
     encoder->enable_seek_table        = config->enable_seek_table;
+    encoder->num_threads              = config->num_threads;
     encoder->max_num_block_samples    = config->max_num_block_samples;
     encoder->max_parcor_order         = config->max_parcor_order;
     encoder->max_longterm_order       = config->max_longterm_order;
@@ -400,6 +405,12 @@ DETECT_NOT_SILENCE:
         return DANA_APIRESULT_OK;
     }
 
+    if (encoder->encode_param.search_mode == 0) {
+        *optimal_num_partitions = 1;
+        optimal_num_block_samples[0] = num_samples;
+        return DANA_APIRESULT_OK;
+    }
+
     uint32_t search_parcor_order = DANAUTILITY_MIN(parcor_order, 8);
 
     if (DANAOptimalEncodeEstimator_SearchOptimalBlockPartitions(
@@ -462,12 +473,70 @@ DANAApiResult DANAEncoder_EncodeBlock(struct DANAEncoder* restrict encoder, cons
 
 DETECT_NOT_SILENCE:
     if (encoder->block_data_type == DANA_BLOCK_DATA_TYPE_COMPRESSDATA) {
-        double min_total_estimate = DBL_MAX;
-        uint32_t num_modes = (num_channels == 2 && (encoder->encode_param.ch_process_method == DANA_CHPROCESSMETHOD_STEREO_MS || encoder->encode_param.ch_process_method == DANA_CHPROCESSMETHOD_STEREO_ADAPTIVE)) ? 4 : 1;
-        uint32_t modes_to_test[4] = { DANA_CHPROCESSMETHOD_NONE, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_CHPROCESSMETHOD_STEREO_LS, DANA_CHPROCESSMETHOD_STEREO_ADAPTIVE };
+        if (encoder->encode_param.search_mode == 0) {
+            if (num_channels == 2 && encoder->encode_param.ch_process_method != DANA_CHPROCESSMETHOD_NONE) {
+                int64_t energy_lr = 0, energy_ms = 0, energy_ls = 0;
+                int64_t sum_l2 = 0, sum_lr = 0;
+                for (uint32_t smpl = 0; smpl < num_samples; smpl++) {
+                    int32_t l = input[0][smpl] >> (32 - encoder->wave_format.bit_per_sample);
+                    int32_t r = input[1][smpl] >> (32 - encoder->wave_format.bit_per_sample);
+                    int32_t m = (l + r) >> 1;
+                    int32_t s = l - r;
+                    energy_lr += (int64_t)DANAUTILITY_ABS(l) + DANAUTILITY_ABS(r);
+                    energy_ms += (int64_t)DANAUTILITY_ABS(m) + DANAUTILITY_ABS(s);
+                    energy_ls += (int64_t)DANAUTILITY_ABS(l) + DANAUTILITY_ABS(s);
+                    sum_l2 += (int64_t)l * l;
+                    sum_lr += (int64_t)l * r;
+                }
 
-        for (uint32_t mode_idx = 0; mode_idx < num_modes; mode_idx++) {
-            uint32_t test_mode = modes_to_test[mode_idx];
+                int32_t alpha_q = 0;
+                if (sum_l2 > 0) {
+                    double alpha = (double)sum_lr / (double)sum_l2;
+                    alpha_q = (int32_t)DANAUtility_Round(alpha * 128.0);
+                    alpha_q = DANAUTILITY_INNER_VALUE(alpha_q, -128, 127);
+                }
+
+                int64_t energy_adaptive = INT64_MAX;
+                if (alpha_q != 0 && alpha_q != 128) {
+                    energy_adaptive = 0;
+                    for (uint32_t smpl = 0; smpl < num_samples; smpl++) {
+                        int32_t l = input[0][smpl] >> (32 - encoder->wave_format.bit_per_sample);
+                        int32_t r = input[1][smpl] >> (32 - encoder->wave_format.bit_per_sample);
+                        int32_t r_adapt = r - (int32_t)(((int64_t)l * alpha_q) >> 7);
+                        energy_adaptive += (int64_t)DANAUTILITY_ABS(l) + DANAUTILITY_ABS(r_adapt);
+                    }
+                }
+
+                int64_t min_e = energy_lr;
+                best_ch_mode = DANA_CHPROCESSMETHOD_NONE;
+
+                if (energy_ms < min_e) {
+                    min_e = energy_ms;
+                    best_ch_mode = DANA_CHPROCESSMETHOD_STEREO_MS;
+                }
+                if (energy_ls < min_e) {
+                    min_e = energy_ls;
+                    best_ch_mode = DANA_CHPROCESSMETHOD_STEREO_LS;
+                }
+                if (energy_adaptive < min_e) {
+                    min_e = energy_adaptive;
+                    best_ch_mode = DANA_CHPROCESSMETHOD_STEREO_ADAPTIVE;
+                    best_alpha_q = alpha_q;
+                }
+            } else {
+                best_ch_mode = DANA_CHPROCESSMETHOD_NONE;
+            }
+            for (uint32_t p_ch = 0; p_ch < num_channels; p_ch++) {
+                best_parcor_order[p_ch] = encoder->encode_param.parcor_order;
+            }
+        } else {
+            double min_total_estimate = DBL_MAX;
+            uint32_t num_modes = (num_channels == 2 && (encoder->encode_param.ch_process_method == DANA_CHPROCESSMETHOD_STEREO_MS || encoder->encode_param.ch_process_method == DANA_CHPROCESSMETHOD_STEREO_ADAPTIVE))
+                                 ? ((encoder->encode_param.search_mode == 1) ? 2 : 4) : 1;
+            uint32_t modes_to_test[4] = { DANA_CHPROCESSMETHOD_NONE, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_CHPROCESSMETHOD_STEREO_LS, DANA_CHPROCESSMETHOD_STEREO_ADAPTIVE };
+
+            for (uint32_t mode_idx = 0; mode_idx < num_modes; mode_idx++) {
+                uint32_t test_mode = modes_to_test[mode_idx];
 
             for (uint32_t ch = 0; ch < num_channels; ch++) {
                 for (uint32_t smpl = 0; smpl < num_samples; smpl++) {
@@ -537,11 +606,12 @@ DETECT_NOT_SILENCE:
             }
 
             if (mode_total_estimate < min_total_estimate) {
-                min_total_estimate = mode_total_estimate;
-                best_ch_mode = test_mode;
-                best_alpha_q = encoder->current_alpha_q;
-                for (uint32_t p_ch = 0; p_ch < num_channels; p_ch++) {
-                    best_parcor_order[p_ch] = mode_best_order[p_ch];
+                    min_total_estimate = mode_total_estimate;
+                    best_ch_mode = test_mode;
+                    best_alpha_q = encoder->current_alpha_q;
+                    for (uint32_t p_ch = 0; p_ch < num_channels; p_ch++) {
+                        best_parcor_order[p_ch] = mode_best_order[p_ch];
+                    }
                 }
             }
         }
@@ -639,33 +709,36 @@ DETECT_NOT_SILENCE:
         }
         memcpy(encoder->residual[ch], encoder->scratch1[ch], sizeof(int32_t) * num_samples);
 
-        DANAPredictorApiResult predictor_ret = DANALongTermCalculator_CalculateCoef(encoder->ltc[ch], encoder->residual[ch], num_samples, &encoder->pitch_period[ch], encoder->longterm_coef[ch], longterm_order);
-        if ((predictor_ret != DANAPREDICTOR_APIRESULT_OK) && (predictor_ret != DANAPREDICTOR_APIRESULT_FAILED_TO_CALCULATION)) {
-            error_flag = 1; break;
-        }
-        if ((predictor_ret == DANAPREDICTOR_APIRESULT_FAILED_TO_CALCULATION) || (encoder->pitch_period[ch] >= DANALONGTERM_MAX_PERIOD)) {
-            encoder->pitch_period[ch] = 0;
-        }
-
-        for (uint32_t ord = 0; ord < longterm_order; ord++) {
-            encoder->longterm_coef_int32[ch][ord] = (int32_t)DANAUtility_Round(encoder->longterm_coef[ch][ord] * DANA_SCALE_2_PLUS_15);
-            encoder->longterm_coef_int32[ch][ord] <<= 16;
-        }
-
         uint64_t sad_lpc = 0;
         for (uint32_t smpl = 0; smpl < num_samples; smpl++) sad_lpc += (uint32_t)DANAUTILITY_ABS(encoder->residual[ch][smpl]);
         
         uint64_t sad_ltp = UINT64_MAX;
         uint8_t ltp_avail = 0;
+        encoder->pitch_period[ch] = 0;
 
-        if (encoder->pitch_period[ch] >= DANALONGTERM_MIN_PITCH_THRESHOULD) {
-            if (DANALongTermSynthesizer_Reset(encoder->ltms[ch]) != DANAPREDICTOR_APIRESULT_OK) {
+        if (longterm_order > 0) {
+            DANAPredictorApiResult predictor_ret = DANALongTermCalculator_CalculateCoef(encoder->ltc[ch], encoder->residual[ch], num_samples, &encoder->pitch_period[ch], encoder->longterm_coef[ch], longterm_order);
+            if ((predictor_ret != DANAPREDICTOR_APIRESULT_OK) && (predictor_ret != DANAPREDICTOR_APIRESULT_FAILED_TO_CALCULATION)) {
                 error_flag = 1; break;
             }
-            if (DANALongTermSynthesizer_PredictInt32(encoder->ltms[ch], encoder->residual[ch], num_samples, encoder->pitch_period[ch], encoder->longterm_coef_int32[ch], longterm_order, encoder->res_ltp[ch]) == DANAPREDICTOR_APIRESULT_OK) {
-                sad_ltp = 0;
-                for (uint32_t smpl = 0; smpl < num_samples; smpl++) sad_ltp += (uint32_t)DANAUTILITY_ABS(encoder->res_ltp[ch][smpl]);
-                ltp_avail = 1;
+            if ((predictor_ret == DANAPREDICTOR_APIRESULT_FAILED_TO_CALCULATION) || (encoder->pitch_period[ch] >= DANALONGTERM_MAX_PERIOD)) {
+                encoder->pitch_period[ch] = 0;
+            }
+
+            for (uint32_t ord = 0; ord < longterm_order; ord++) {
+                encoder->longterm_coef_int32[ch][ord] = (int32_t)DANAUtility_Round(encoder->longterm_coef[ch][ord] * DANA_SCALE_2_PLUS_15);
+                encoder->longterm_coef_int32[ch][ord] <<= 16;
+            }
+
+            if (encoder->pitch_period[ch] >= DANALONGTERM_MIN_PITCH_THRESHOULD) {
+                if (DANALongTermSynthesizer_Reset(encoder->ltms[ch]) != DANAPREDICTOR_APIRESULT_OK) {
+                    error_flag = 1; break;
+                }
+                if (DANALongTermSynthesizer_PredictInt32(encoder->ltms[ch], encoder->residual[ch], num_samples, encoder->pitch_period[ch], encoder->longterm_coef_int32[ch], longterm_order, encoder->res_ltp[ch]) == DANAPREDICTOR_APIRESULT_OK) {
+                    sad_ltp = 0;
+                    for (uint32_t smpl = 0; smpl < num_samples; smpl++) sad_ltp += (uint32_t)DANAUTILITY_ABS(encoder->res_ltp[ch][smpl]);
+                    ltp_avail = 1;
+                }
             }
         }
 
@@ -685,6 +758,11 @@ DETECT_NOT_SILENCE:
         lms_orders[1] = DANAUTILITY_MAX(4, DANAUTILITY_ROUNDUP2POWERED(lms_orders[0] / 2));
         lms_orders[2] = DANAUTILITY_MAX(4, DANAUTILITY_ROUNDUP2POWERED(lms_orders[1] / 2));
 
+        uint8_t max_search_stages = (encoder->encode_param.search_mode == 0) ? 1 : 
+                                    ((encoder->encode_param.search_mode == 1) ? 2 : DANA_MAX_LMS_STAGES);
+        uint8_t num_step_trials   = (encoder->encode_param.search_mode == 0) ? 1 :
+                                    ((encoder->encode_param.search_mode == 1) ? 2 : 4);
+
         for (int use_ltp = 0; use_ltp <= (ltp_avail ? 1 : 0); use_ltp++) {
             uint64_t current_sad = use_ltp ? sad_ltp : sad_lpc;
             int32_t* base_res = use_ltp ? encoder->res_ltp[ch] : encoder->residual[ch];
@@ -696,22 +774,23 @@ DETECT_NOT_SILENCE:
             uint8_t stages_used = 0;
             uint8_t steps[DANA_MAX_LMS_STAGES] = {0};
 
-            for (int stage = 0; stage < DANA_MAX_LMS_STAGES; stage++) {
+            for (int stage = 0; stage < max_search_stages; stage++) {
                 uint32_t order = lms_orders[stage];
                 if (order < 4 || order > encoder->encode_param.lms_order_per_filter) break;
 
                 uint64_t best_stage_sad = UINT64_MAX;
-                uint8_t best_step = 0;
+                uint8_t best_step = (encoder->encode_param.search_mode == 0) ? 1 : 0;
 
-                for (uint8_t step = 0; step < 4; step++) {
+                for (uint8_t step = 0; step < num_step_trials; step++) {
+                    uint8_t trial_step = (encoder->encode_param.search_mode == 0) ? 1 : step;
                     DANALMSFilter_Reset(encoder->nlmsc[ch][stage]);
-                    DANALMSFilter_PredictInt32(encoder->nlmsc[ch][stage], order, buf_in, num_samples, buf_out, step);
+                    DANALMSFilter_PredictInt32(encoder->nlmsc[ch][stage], order, buf_in, num_samples, buf_out, trial_step);
                     uint64_t sad = 0;
                     for (uint32_t i = 0; i < num_samples; i++) sad += (uint32_t)DANAUTILITY_ABS(buf_out[i]);
 
                     if (sad < best_stage_sad) {
                         best_stage_sad = sad;
-                        best_step = step;
+                        best_step = trial_step;
                     }
                 }
 
@@ -864,6 +943,125 @@ DETECT_NOT_SILENCE:
     return DANA_APIRESULT_OK;
 }
 
+typedef struct {
+    uint8_t* data;
+    uint32_t size;
+    uint32_t num_blocks;
+    uint32_t max_block_size;
+    uint32_t max_bit_per_second;
+    uint32_t start_sample;
+    uint32_t num_samples;
+    DANAApiResult res;
+} DANAChunkResult;
+
+typedef struct {
+    struct DANAEncoder* base_encoder;
+    const int32_t* const* input;
+    uint32_t total_samples;
+    uint32_t chunk_size;
+    uint32_t total_chunks;
+    DANAChunkResult* results;
+    atomic_uint next_chunk_idx;
+    atomic_uint completed_chunks;
+} DANAThreadPoolContext;
+
+static void* dana_encode_worker(void* arg) {
+    DANAThreadPoolContext* ctx = (DANAThreadPoolContext*)arg;
+    struct DANAEncoder* base = ctx->base_encoder;
+
+    struct DANAEncoderConfig worker_cfg = {
+        .max_num_channels         = base->max_num_channels,
+        .max_num_block_samples    = base->max_num_block_samples,
+        .max_parcor_order         = base->max_parcor_order,
+        .max_longterm_order       = base->max_longterm_order,
+        .max_lms_order_per_filter = base->max_lms_order_per_filter,
+        .verpose_flag             = 0,
+        .enable_seek_table        = 0,
+        .num_threads              = 1
+    };
+
+    struct DANAEncoder* enc = DANAEncoder_Create(&worker_cfg);
+    if (!enc) return NULL;
+    DANAEncoder_SetWaveFormat(enc, &base->wave_format);
+    DANAEncoder_SetEncodeParameter(enc, &base->encode_param);
+
+    uint32_t max_buf = DANA_CalculateSufficientBlockSize(base->wave_format.num_channels, ctx->chunk_size, base->wave_format.bit_per_sample) + 8192;
+    uint8_t* tmp_buf = malloc(max_buf);
+
+    while (1) {
+        uint32_t chunk_idx = atomic_fetch_add(&ctx->next_chunk_idx, 1);
+        if (chunk_idx >= ctx->total_chunks) break;
+
+        DANAChunkResult* r = &ctx->results[chunk_idx];
+        uint32_t offset = r->start_sample;
+        uint32_t samples_left = r->num_samples;
+
+        r->data = NULL;
+        r->size = 0;
+        r->num_blocks = 0;
+        r->max_block_size = 0;
+        r->max_bit_per_second = 0;
+        r->res = DANA_APIRESULT_OK;
+
+        uint32_t chunk_bytes = 0;
+        while (samples_left > 0 && r->res == DANA_APIRESULT_OK) {
+            const int32_t* input_ptr[DANA_MAX_CHANNELS];
+            for (uint32_t ch = 0; ch < enc->wave_format.num_channels; ch++) {
+                input_ptr[ch] = &ctx->input[ch][offset];
+            }
+
+            uint32_t step_samples = DANAUTILITY_MIN(enc->encode_param.max_num_block_samples, samples_left);
+            uint32_t num_parts = 1;
+
+            if (enc->encode_param.search_mode > 0) {
+                DANAApiResult pret = DANAEncoder_SearchOptimalBlockPartitions(
+                    enc, input_ptr, step_samples,
+                    (uint32_t)DANAUTILITY_MIN(DANA_MIN_BLOCK_NUM_SAMPLES, step_samples),
+                    DANA_SEARCH_BLOCK_NUM_SAMPLES_DELTA, step_samples,
+                    &num_parts, enc->num_block_partition_samples);
+                if (pret != DANA_APIRESULT_OK) { r->res = pret; break; }
+            } else {
+                enc->num_block_partition_samples[0] = step_samples;
+            }
+
+            for (uint32_t part = 0; part < num_parts; part++) {
+                uint32_t n_enc = enc->num_block_partition_samples[part];
+                for (uint32_t ch = 0; ch < enc->wave_format.num_channels; ch++) {
+                    input_ptr[ch] = &ctx->input[ch][offset];
+                }
+
+                uint32_t bsize = 0;
+                DANAApiResult eret = DANAEncoder_EncodeBlock(enc, input_ptr, n_enc, &tmp_buf[chunk_bytes], max_buf - chunk_bytes, &bsize);
+                if (eret != DANA_APIRESULT_OK) { r->res = eret; break; }
+
+                chunk_bytes += bsize;
+                offset += n_enc;
+                samples_left -= n_enc;
+                r->num_blocks++;
+                if (bsize > r->max_block_size) r->max_block_size = bsize;
+                uint32_t bps = (8 * bsize * enc->wave_format.sampling_rate) / n_enc;
+                if (bps > r->max_bit_per_second) r->max_bit_per_second = bps;
+            }
+        }
+
+        if (r->res == DANA_APIRESULT_OK && chunk_bytes > 0) {
+            r->data = malloc(chunk_bytes);
+            if (r->data) {
+                memcpy(r->data, tmp_buf, chunk_bytes);
+                r->size = chunk_bytes;
+            } else {
+                r->res = DANA_APIRESULT_INSUFFICIENT_BUFFER_SIZE;
+            }
+        }
+
+        atomic_fetch_add(&ctx->completed_chunks, 1);
+    }
+
+    free(tmp_buf);
+    DANAEncoder_Destroy(enc);
+    return NULL;
+}
+
 DANAApiResult DANAEncoder_EncodeWhole(struct DANAEncoder* restrict encoder, const int32_t* const* restrict input, uint32_t num_samples, uint8_t* restrict data, uint32_t data_size, uint32_t* restrict output_size) {
     if (encoder == NULL || input == NULL || data == NULL || output_size == NULL) return DANA_APIRESULT_INVALID_ARGUMENT;
 
@@ -879,11 +1077,60 @@ DANAApiResult DANAEncoder_EncodeWhole(struct DANAEncoder* restrict encoder, cons
     if ((api_ret = DANAEncoder_EncodeHeader(&header, data, data_size, &header_size_out)) != DANA_APIRESULT_OK) return api_ret;
 
     header.wave_format.offset_lshift = encoder->wave_format.offset_lshift = (uint8_t)DANAEncoder_CalculateLeftShiftOffset(encoder, input, num_samples);
-    DANA_Assert(encoder->wave_format.bit_per_sample > encoder->wave_format.offset_lshift);
+
+    uint32_t chunk_size = encoder->encode_param.max_num_block_samples;
+    uint32_t total_chunks = (num_samples + chunk_size - 1) / chunk_size;
+    if (total_chunks == 0) total_chunks = 1;
+
+    DANAChunkResult* results = calloc(total_chunks, sizeof(DANAChunkResult));
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        results[i].start_sample = i * chunk_size;
+        results[i].num_samples  = DANAUTILITY_MIN(chunk_size, num_samples - results[i].start_sample);
+    }
+
+    uint32_t num_threads = encoder->num_threads;
+    if (num_threads == 0) {
+        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+    }
+    if (num_threads > total_chunks) num_threads = total_chunks;
+    if (num_threads < 1) num_threads = 1;
+
+    DANAThreadPoolContext ctx = {
+        .base_encoder      = encoder,
+        .input             = input,
+        .total_samples     = num_samples,
+        .chunk_size        = chunk_size,
+        .total_chunks      = total_chunks,
+        .results           = results,
+        .next_chunk_idx    = 0,
+        .completed_chunks  = 0
+    };
+
+    if (num_threads > 1) {
+        pthread_t threads[64];
+        uint32_t active_threads = DANAUTILITY_MIN(num_threads, 64);
+        for (uint32_t i = 0; i < active_threads; i++) {
+            pthread_create(&threads[i], NULL, dana_encode_worker, &ctx);
+        }
+        for (uint32_t i = 0; i < active_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+    } else {
+        dana_encode_worker(&ctx);
+    }
+
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        if (results[i].res != DANA_APIRESULT_OK) {
+            DANAApiResult err = results[i].res;
+            for (uint32_t j = 0; j < total_chunks; j++) if (results[j].data) free(results[j].data);
+            free(results);
+            return err;
+        }
+    }
 
     uint32_t cur_output_size = header_size_out;
     uint32_t max_block_size = 0;
-    uint32_t encode_offset_sample = 0;
     uint32_t num_blocks = 0;
     uint32_t max_bit_per_second = 0;
 
@@ -896,83 +1143,48 @@ DANAApiResult DANAEncoder_EncodeWhole(struct DANAEncoder* restrict encoder, cons
     if (encoder->enable_seek_table) {
         seek_samples = malloc(sizeof(uint32_t) * max_seek_points);
         seek_offsets = malloc(sizeof(uint32_t) * max_seek_points);
-        if (!seek_samples || !seek_offsets) {
-            free(seek_samples); free(seek_offsets);
-            return DANA_APIRESULT_NG;
-        }
     }
 
-    while (encode_offset_sample < num_samples) {
-        if (cur_output_size >= data_size) {
-            free(seek_samples); free(seek_offsets);
-            return DANA_APIRESULT_INSUFFICIENT_BUFFER_SIZE;
-        }
+    for (uint32_t i = 0; i < total_chunks; i++) {
+        DANAChunkResult* r = &results[i];
 
-        if (encoder->enable_seek_table && encode_offset_sample >= next_seek_target) {
+        if (encoder->enable_seek_table && seek_samples && r->start_sample >= next_seek_target) {
             if (num_seek_points < max_seek_points) {
-                seek_samples[num_seek_points] = encode_offset_sample;
+                seek_samples[num_seek_points] = r->start_sample;
                 seek_offsets[num_seek_points] = cur_output_size - header_size_out;
                 num_seek_points++;
                 next_seek_target += encoder->wave_format.sampling_rate;
             }
         }
 
-        const int32_t* input_ptr[DANA_MAX_CHANNELS];
-        for (uint32_t ch = 0; ch < encoder->wave_format.num_channels; ch++) {
-            input_ptr[ch] = &input[ch][encode_offset_sample];
-        }
-
-        uint32_t num_remain_samples = num_samples - encode_offset_sample;
-        uint32_t num_partitions;
-
-        if ((api_ret = DANAEncoder_SearchOptimalBlockPartitions(encoder, input_ptr, DANAUTILITY_MIN(encoder->encode_param.max_num_block_samples, num_remain_samples), (uint32_t)DANAUTILITY_MIN(DANA_MIN_BLOCK_NUM_SAMPLES, num_remain_samples), DANA_SEARCH_BLOCK_NUM_SAMPLES_DELTA, DANAUTILITY_MIN(encoder->encode_param.max_num_block_samples, num_remain_samples), &num_partitions, encoder->num_block_partition_samples)) != DANA_APIRESULT_OK) {
+        if (cur_output_size + r->size > data_size) {
             free(seek_samples); free(seek_offsets);
-            return api_ret;
+            for (uint32_t j = 0; j < total_chunks; j++) if (results[j].data) free(results[j].data);
+            free(results);
+            return DANA_APIRESULT_INSUFFICIENT_BUFFER_SIZE;
         }
 
-        for (uint32_t part = 0; part < num_partitions; part++) {
-            uint32_t num_encode_samples = encoder->num_block_partition_samples[part];
-            for (uint32_t ch = 0; ch < encoder->wave_format.num_channels; ch++) {
-                input_ptr[ch] = &input[ch][encode_offset_sample];
-            }
-            
-            uint32_t block_size;
-            if ((api_ret = DANAEncoder_EncodeBlock(encoder, input_ptr, num_encode_samples, &data[cur_output_size], data_size - cur_output_size, &block_size)) != DANA_APIRESULT_OK) {
-                free(seek_samples); free(seek_offsets);
-                return api_ret;
-            }
-            
-            cur_output_size += block_size;
-            encode_offset_sample += num_encode_samples;
-            if (block_size > max_block_size) max_block_size = block_size;
-            
-            uint32_t block_bit_per_second = (8 * block_size * encoder->wave_format.sampling_rate) / num_encode_samples;
-            if (block_bit_per_second > max_bit_per_second) max_bit_per_second = block_bit_per_second;
-            num_blocks++;
-        }
+        memcpy(&data[cur_output_size], r->data, r->size);
+        cur_output_size += r->size;
+        num_blocks += r->num_blocks;
+        if (r->max_block_size > max_block_size) max_block_size = r->max_block_size;
+        if (r->max_bit_per_second > max_bit_per_second) max_bit_per_second = r->max_bit_per_second;
 
-        if (encoder->verpose_flag != 0) {
-            uint32_t output_original_size = encode_offset_sample * encoder->wave_format.num_channels * encoder->wave_format.bit_per_sample / 8;
-            printf("progress:%2u%% (compress ratio:%3.1f %%)\r", (unsigned int)((100 * encode_offset_sample) / num_samples), ((double)cur_output_size / output_original_size) * 100.0);
-            fflush(stdout);
-        }
+        free(r->data);
+        r->data = NULL;
     }
+    free(results);
 
-    if (cur_output_size > data_size) {
-        free(seek_samples); free(seek_offsets);
-        return DANA_APIRESULT_INSUFFICIENT_DATA_SIZE;
-    }
-
-    if (encoder->enable_seek_table) {
+    if (encoder->enable_seek_table && seek_samples) {
         uint32_t seek_table_max_size = 4 + num_seek_points * 10;
         uint8_t* sktb_buf = malloc(seek_table_max_size);
         if (sktb_buf) {
             uint8_t* sktb_p = sktb_buf;
             DANAByteArray_PutUint32(&sktb_p, num_seek_points);
-            
+
             uint32_t prev_sample = 0;
             uint32_t prev_offset = 0;
-            for(uint32_t i=0; i<num_seek_points; i++) {
+            for (uint32_t i = 0; i < num_seek_points; i++) {
                 uint32_t d_sample = seek_samples[i] - prev_sample;
                 uint32_t d_offset = seek_offsets[i] - prev_offset;
                 put_varint(&sktb_p, d_sample);
@@ -982,19 +1194,18 @@ DANAApiResult DANAEncoder_EncodeWhole(struct DANAEncoder* restrict encoder, cons
             }
             header.metadata.seek_table_size = (uint32_t)(sktb_p - sktb_buf);
             header.metadata.seek_table = sktb_buf;
-            
+
             uint8_t* dummy_hdr = malloc(1024 * 1024);
             uint32_t new_header_size = 0;
             DANAEncoder_EncodeHeader(&header, dummy_hdr, 1024 * 1024, &new_header_size);
             free(dummy_hdr);
-            
+
             uint32_t audio_data_size = cur_output_size - header_size_out;
             if (new_header_size + audio_data_size > data_size) {
-                free(seek_samples); free(seek_offsets);
-                free(sktb_buf);
+                free(seek_samples); free(seek_offsets); free(sktb_buf);
                 return DANA_APIRESULT_INSUFFICIENT_BUFFER_SIZE;
             }
-            
+
             memmove(data + new_header_size, data + header_size_out, audio_data_size);
             cur_output_size = new_header_size + audio_data_size;
         }

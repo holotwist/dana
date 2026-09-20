@@ -47,7 +47,8 @@ target_include_directories(dana_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/private>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include/public>
 )
-target_link_libraries(dana_core m)
+find_package(Threads REQUIRED)
+target_link_libraries(dana_core Threads::Threads m)
 
 add_executable(dana src/main.c)
 target_link_libraries(dana dana_core)

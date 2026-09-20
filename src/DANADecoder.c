@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
 #define DANADECODER_STATUS_FLAG_SET_WAVE_FORMAT      (1 << 0)
 #define DANADECODER_STATUS_FLAG_SET_ENCODE_PARAMETER (1 << 1)
@@ -47,6 +50,7 @@ struct DANADecoder {
     int32_t                          current_alpha_q;
     uint8_t                          lms_num_stages[DANA_MAX_CHANNELS];
     uint8_t                          lms_step_idx[DANA_MAX_CHANNELS][DANA_MAX_LMS_STAGES];
+    uint32_t                         num_threads;
 };
 
 struct DANAStreamingDecoder {
@@ -78,6 +82,7 @@ struct DANADecoder* DANADecoder_Create(const struct DANADecoderConfig* config) {
     decoder->max_lms_order_per_filter = config->max_lms_order_per_filter;
     decoder->enable_crc_check         = config->enable_crc_check;
     decoder->verpose_flag             = config->verpose_flag;
+    decoder->num_threads              = config->num_threads;
 
     decoder->parcor_coef   = malloc(sizeof(int32_t*) * config->max_num_channels);
     decoder->longterm_coef = malloc(sizeof(int32_t*) * config->max_num_channels);
@@ -190,6 +195,7 @@ DANAApiResult DANADecoder_DecodeHeader(const uint8_t* restrict data, uint32_t da
     DANAByteArray_GetUint8(&data_pos, &u8buf); tmp_header.encode_param.ch_process_method = (uint32_t)u8buf;
     DANAByteArray_GetUint32(&data_pos, &tmp_header.num_blocks);
     DANAByteArray_GetUint16(&data_pos, &u16buf); tmp_header.encode_param.max_num_block_samples = (uint32_t)u16buf;
+    tmp_header.encode_param.search_mode = 0;
     DANAByteArray_GetUint32(&data_pos, &tmp_header.max_block_size);
     DANAByteArray_GetUint32(&data_pos, &tmp_header.max_bit_per_second);
 
@@ -568,7 +574,7 @@ static void DANADecoder_ResetAllSynthesizer(struct DANADecoder* decoder) {
     }
 }
 
-static DANAApiResult DANADecoder_DecodeBlock(struct DANADecoder* decoder, const uint8_t* restrict data, uint32_t data_size, int32_t** restrict buffer, uint32_t buffer_num_samples, uint32_t* restrict output_block_size, uint32_t* restrict output_num_samples) {
+DANAApiResult DANADecoder_DecodeBlock(struct DANADecoder* decoder, const uint8_t* restrict data, uint32_t data_size, int32_t** restrict buffer, uint32_t buffer_num_samples, uint32_t* restrict output_block_size, uint32_t* restrict output_num_samples) {
     if (decoder == NULL || data == NULL || buffer == NULL || output_block_size == NULL || output_num_samples == NULL) return DANA_APIRESULT_INVALID_ARGUMENT;
     if ((!(decoder->status_flag & DANADECODER_STATUS_FLAG_SET_WAVE_FORMAT)) || (!(decoder->status_flag & DANADECODER_STATUS_FLAG_SET_ENCODE_PARAMETER))) return DANA_APIRESULT_PARAMETER_NOT_SET;
 
@@ -603,43 +609,156 @@ static DANAApiResult DANADecoder_DecodeBlock(struct DANADecoder* decoder, const 
     return DANA_APIRESULT_OK;
 }
 
+typedef struct {
+    uint32_t byte_offset;
+    uint32_t sample_offset;
+    uint32_t block_size;
+    uint32_t num_samples;
+} DANABlockIndex;
+
+typedef struct {
+    struct DANADecoder* base_decoder;
+    const uint8_t* data;
+    uint32_t data_size;
+    int32_t** buffer;
+    uint32_t buffer_num_samples;
+    const DANABlockIndex* blocks;
+    uint32_t total_blocks;
+    atomic_uint next_block_idx;
+    atomic_int error_code;
+} DANADecodeThreadPoolContext;
+
+static void* dana_decode_worker(void* arg) {
+    DANADecodeThreadPoolContext* ctx = (DANADecodeThreadPoolContext*)arg;
+    struct DANADecoder* base = ctx->base_decoder;
+
+    struct DANADecoderConfig worker_cfg = {
+        .max_num_channels         = base->max_num_channels,
+        .max_num_block_samples    = base->max_num_block_samples,
+        .max_parcor_order         = base->max_parcor_order,
+        .max_longterm_order       = base->max_longterm_order,
+        .max_lms_order_per_filter = base->max_lms_order_per_filter,
+        .enable_crc_check         = base->enable_crc_check,
+        .verpose_flag             = 0,
+        .num_threads              = 1
+    };
+
+    struct DANADecoder* dec = DANADecoder_Create(&worker_cfg);
+    if (!dec) return NULL;
+    DANADecoder_SetWaveFormat(dec, &base->wave_format);
+    DANADecoder_SetEncodeParameter(dec, &base->encode_param);
+
+    while (atomic_load(&ctx->error_code) == DANA_APIRESULT_OK) {
+        uint32_t idx = atomic_fetch_add(&ctx->next_block_idx, 1);
+        if (idx >= ctx->total_blocks) break;
+
+        const DANABlockIndex* b = &ctx->blocks[idx];
+        int32_t* output_ptr[DANA_MAX_CHANNELS];
+        for (uint32_t ch = 0; ch < dec->wave_format.num_channels; ch++) {
+            output_ptr[ch] = &ctx->buffer[ch][b->sample_offset];
+        }
+
+        uint32_t out_bsize, out_nsamples;
+        DANAApiResult ret = DANADecoder_DecodeBlock(
+            dec, &ctx->data[b->byte_offset], ctx->data_size - b->byte_offset,
+            output_ptr, ctx->buffer_num_samples - b->sample_offset,
+            &out_bsize, &out_nsamples);
+
+        if (ret != DANA_APIRESULT_OK) {
+            atomic_store(&ctx->error_code, ret);
+            break;
+        }
+    }
+
+    DANADecoder_Destroy(dec);
+    return NULL;
+}
+
 DANAApiResult DANADecoder_DecodeWhole(struct DANADecoder* restrict decoder, const uint8_t* restrict data, uint32_t data_size, int32_t** restrict buffer, uint32_t buffer_num_samples, uint32_t* restrict output_num_samples) {
     if (decoder == NULL || buffer == NULL || data == NULL || output_num_samples == NULL) return DANA_APIRESULT_INVALID_ARGUMENT;
 
     struct DANAHeaderInfo header;
     uint32_t header_size_out;
     DANAApiResult api_ret;
-    
+
     if ((api_ret = DANADecoder_DecodeHeader(data, data_size, &header, &header_size_out)) != DANA_APIRESULT_OK) return api_ret;
     if ((api_ret = DANADecoder_SetWaveFormat(decoder, &header.wave_format)) != DANA_APIRESULT_OK) return api_ret;
     if ((api_ret = DANADecoder_SetEncodeParameter(decoder, &header.encode_param)) != DANA_APIRESULT_OK) return api_ret;
 
-    uint32_t decode_offset_byte = header_size_out;
-    uint32_t decode_offset_sample = 0;
-    
-    while (decode_offset_sample < header.num_samples) {
-        if (decode_offset_byte > data_size) return DANA_APIRESULT_INSUFFICIENT_DATA_SIZE;
+    /* Scan block headers */
+    uint32_t max_scan_blocks = (header.num_blocks > 0) ? header.num_blocks : 65536;
+    DANABlockIndex* blocks = malloc(sizeof(DANABlockIndex) * max_scan_blocks);
+    if (!blocks) { DANAMetadata_Release(&header.metadata); return DANA_APIRESULT_INSUFFICIENT_BUFFER_SIZE; }
 
-        int32_t* output_ptr[DANA_MAX_CHANNELS];
-        for (uint32_t ch = 0; ch < decoder->wave_format.num_channels; ch++) {
-            output_ptr[ch] = &buffer[ch][decode_offset_sample];
+    uint32_t scan_byte = header_size_out;
+    uint32_t scan_sample = 0;
+    uint32_t num_blocks_found = 0;
+
+    while (scan_sample < header.num_samples && scan_byte + 9 <= data_size) {
+        if (num_blocks_found >= max_scan_blocks) {
+            max_scan_blocks *= 2;
+            DANABlockIndex* new_blocks = realloc(blocks, sizeof(DANABlockIndex) * max_scan_blocks);
+            if (!new_blocks) { free(blocks); DANAMetadata_Release(&header.metadata); return DANA_APIRESULT_INSUFFICIENT_BUFFER_SIZE; }
+            blocks = new_blocks;
         }
 
-        uint32_t block_size, block_num_samples;
-        if ((api_ret = DANADecoder_DecodeBlock(decoder, &data[decode_offset_byte], data_size - decode_offset_byte, output_ptr, buffer_num_samples - decode_offset_sample, &block_size, &block_num_samples)) != DANA_APIRESULT_OK) {
-            return api_ret;
-        }
+        uint16_t sync = ((uint16_t)data[scan_byte] << 8) | data[scan_byte + 1];
+        if (sync != DANA_BLOCK_SYNC_CODE) break;
 
-        decode_offset_byte += block_size;
-        decode_offset_sample += block_num_samples;
+        uint32_t bsize = (((uint32_t)data[scan_byte + 2] << 16) | ((uint32_t)data[scan_byte + 3] << 8) | data[scan_byte + 4]) + 5;
+        uint32_t nsamples = ((uint32_t)data[scan_byte + 7] << 8) | data[scan_byte + 8];
 
-        if (decoder->verpose_flag != 0) {
-            printf("progress:%2u%% \r", (unsigned int)((100 * decode_offset_byte) / data_size));
-            fflush(stdout);
-        }
+        blocks[num_blocks_found].byte_offset   = scan_byte;
+        blocks[num_blocks_found].sample_offset = scan_sample;
+        blocks[num_blocks_found].block_size    = bsize;
+        blocks[num_blocks_found].num_samples   = nsamples;
+
+        scan_byte += bsize;
+        scan_sample += nsamples;
+        num_blocks_found++;
     }
 
-    *output_num_samples = decode_offset_sample;
+    uint32_t num_threads = decoder->num_threads;
+    if (num_threads == 0) {
+        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+    }
+    if (num_threads > num_blocks_found) num_threads = num_blocks_found;
+    if (num_threads < 1) num_threads = 1;
+
+    DANADecodeThreadPoolContext ctx = {
+        .base_decoder       = decoder,
+        .data               = data,
+        .data_size          = data_size,
+        .buffer             = buffer,
+        .buffer_num_samples = buffer_num_samples,
+        .blocks             = blocks,
+        .total_blocks       = num_blocks_found,
+        .next_block_idx     = 0,
+        .error_code         = DANA_APIRESULT_OK
+    };
+
+    if (num_threads > 1) {
+        pthread_t threads[64];
+        uint32_t active_threads = DANAUTILITY_MIN(num_threads, 64);
+        for (uint32_t i = 0; i < active_threads; i++) {
+            pthread_create(&threads[i], NULL, dana_decode_worker, &ctx);
+        }
+        for (uint32_t i = 0; i < active_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+    } else {
+        dana_decode_worker(&ctx);
+    }
+
+    free(blocks);
+    DANAApiResult err = (DANAApiResult)atomic_load(&ctx.error_code);
+    if (err != DANA_APIRESULT_OK) {
+        DANAMetadata_Release(&header.metadata);
+        return err;
+    }
+
+    *output_num_samples = scan_sample;
     DANAMetadata_Release(&header.metadata);
     return DANA_APIRESULT_OK;
 }

@@ -15,6 +15,7 @@ struct DANAEncoderConfig {
     uint32_t max_lms_order_per_filter;
     uint8_t  verpose_flag;
     uint8_t  enable_seek_table;
+    uint32_t num_threads; // 0: auto-detect all CPU cores
 };
 
 #ifdef __cplusplus
