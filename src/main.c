@@ -366,7 +366,7 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
     }
 
     if (verpose_flag) {
-        printf("Encode success! size: -> %u bytes\n", header_size + audio_bytes_written);
+        fprintf(stderr, "Encode success! size: -> %u bytes\n", header_size + audio_bytes_written);
     }
 
     free(raw_io_buf);
@@ -789,7 +789,8 @@ static void print_usage(char** argv) {
 }
 
 static void print_version_info(void) {
-    printf("DANA - Dana Audio Non-lossy Archive Version %s\n", DANA_VERSION_STRING);
+    printf("DANA - Digital Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
+    printf("Copyright (c) 2026 holotwist. All rights reserved.\n");
 }
 
 int main(int argc, char** argv) {
@@ -831,6 +832,11 @@ int main(int argc, char** argv) {
 
     if (CommandLineParser_GetOptionAcquired(command_line_spec, "verpose")) verbose_flag = 1;
     else if (CommandLineParser_GetOptionAcquired(command_line_spec, "quiet")) verbose_flag = 0;
+
+    if (verbose_flag) {
+        fprintf(stderr, "DANA - Digital Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
+        fprintf(stderr, "Copyright (c) 2026 holotwist. All rights reserved.\n\n");
+    }
 
     if (CommandLineParser_GetOptionAcquired(command_line_spec, "decode")) {
         uint8_t enable_crc_check = 1;

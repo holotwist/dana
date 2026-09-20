@@ -6,29 +6,26 @@ set(CMAKE_C_STANDARD 11)
 include(CheckCCompilerFlag)
 
 # This is for all architectures
+option(PORTABLE_BUILD "Disable native architecture optimizations" OFF)
+option(MODERN_X86_64 "Target modern x86-64 architecture levels" OFF)
+set(X86_64_LEVEL "x86-64-v3" CACHE STRING "Target x86-64 microarchitecture level")
+
 add_compile_options(-O3 -flto -ffast-math -funroll-loops -Wall -Wextra)
 add_compile_definitions(NDEBUG)
 
-# Only if we are using x86-like architectures, for AVX instr
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i686|i386|x86)")
-    check_c_compiler_flag("-march=native" HAS_MARCH_NATIVE)
-    if(HAS_MARCH_NATIVE)
-        add_compile_options(-march=native)
-    endif()
-    
-    check_c_compiler_flag("-mavx2" HAS_AVX2)
-    if(HAS_AVX2)
-        add_compile_options(-mavx2)
-    endif()
-    
-    check_c_compiler_flag("-mfma" HAS_FMA)
-    if(HAS_FMA)
-        add_compile_options(-mfma)
-    endif()
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(arm|aarch64|ARM64)")
-    check_c_compiler_flag("-mcpu=native" HAS_MCPU_NATIVE)
-    if(HAS_MCPU_NATIVE)
-        add_compile_options(-mcpu=native)
+if(MODERN_X86_64)
+    add_compile_options(-march=${X86_64_LEVEL})
+elseif(NOT PORTABLE_BUILD)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64|AMD64|i686|i386|x86)")
+        check_c_compiler_flag("-march=native" HAS_MARCH_NATIVE)
+        if(HAS_MARCH_NATIVE)
+            add_compile_options(-march=native)
+        endif()
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(arm|aarch64|ARM64)")
+        check_c_compiler_flag("-mcpu=native" HAS_MCPU_NATIVE)
+        if(HAS_MCPU_NATIVE)
+            add_compile_options(-mcpu=native)
+        endif()
     endif()
 endif()
 
@@ -71,3 +68,13 @@ target_link_libraries(danaplay dana_core ncursesw pthread m ${CMAKE_DL_LIBS})
 
 add_executable(danaplayd src/danaplayd.c)
 target_link_libraries(danaplayd dana_core pthread m ${CMAKE_DL_LIBS})
+
+install(TARGETS dana
+    RUNTIME DESTINATION bin
+    COMPONENT essential
+)
+
+install(TARGETS danaplay danaplayd
+    RUNTIME DESTINATION bin
+    COMPONENT extras
+)
