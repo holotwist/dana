@@ -487,9 +487,9 @@ static int do_decode(const char* in_filename, const char* out_filename, uint8_t 
     free(full_hdr);
 
     if (verpose_flag) {
-        printf("Num Channels:                %u\n", header.wave_format.num_channels);
-        printf("Bit Per Sample:              %u\n", header.wave_format.bit_per_sample);
-        printf("Sampling Rate:               %u\n", header.wave_format.sampling_rate);
+        fprintf(stderr, "Num Channels:                %u\n", header.wave_format.num_channels);
+        fprintf(stderr, "Bit Per Sample:              %u\n", header.wave_format.bit_per_sample);
+        fprintf(stderr, "Sampling Rate:               %u\n", header.wave_format.sampling_rate);
     }
 
     FILE* out_fp = is_out_pipe ? stdout : fopen(out_filename, "wb");

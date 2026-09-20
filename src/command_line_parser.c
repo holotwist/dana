@@ -151,7 +151,7 @@ CommandLineParserResult CommandLineParser_ParseArguments(
                 fprintf(stderr, "%s: Unknown long option - \"%s\" \n", argv[0], &arg_str[2]);
                 return COMMAND_LINE_PARSER_RESULT_UNKNOWN_OPTION;
             }
-        } else if (arg_str[0] == '-') {
+        } else if (arg_str[0] == '-' && arg_str[1] != '\0') {
             for (uint32_t str_index = 1; arg_str[str_index] != '\0'; str_index++) {
                 uint32_t spec_no;
                 for (spec_no = 0; spec_no < num_specs; spec_no++) {
