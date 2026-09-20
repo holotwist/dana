@@ -3,7 +3,7 @@
 
 #include "DANA.h"
 
-#define DANA_DECODER_VERSION_STRING "0.0.1(beta)"
+#define DANA_DECODER_VERSION_STRING "1.0.0"
 
 struct DANADecoder;
 struct DANAStreamingDecoder;
@@ -16,6 +16,7 @@ struct DANADecoderConfig {
     uint32_t max_lms_order_per_filter;
     uint8_t  enable_crc_check;
     uint8_t  verpose_flag;
+    uint32_t num_threads; // 0: auto-detect all CPU cores
 };
 
 struct DANAStreamingDecoderConfig {
@@ -37,6 +38,7 @@ void DANADecoder_Destroy(struct DANADecoder* decoder);
 DANAApiResult DANADecoder_SetWaveFormat(struct DANADecoder* decoder, const struct DANAWaveFormat* wave_format);
 DANAApiResult DANADecoder_SetEncodeParameter(struct DANADecoder* decoder, const struct DANAEncodeParameter* encode_param);
 
+DANAApiResult DANADecoder_DecodeBlock(struct DANADecoder* decoder, const uint8_t* restrict data, uint32_t data_size, int32_t** restrict buffer, uint32_t buffer_num_samples, uint32_t* restrict output_block_size, uint32_t* restrict output_num_samples);
 DANAApiResult DANADecoder_DecodeWhole(struct DANADecoder* restrict decoder, const uint8_t* restrict data, uint32_t data_size, int32_t** restrict buffer, uint32_t buffer_num_samples, uint32_t* restrict output_num_samples);
 
 DANAApiResult DANADecoder_GetSeekPoint(const struct DANAMetadata* meta, uint32_t target_sample, uint32_t* out_sample, uint32_t* out_byte_offset);

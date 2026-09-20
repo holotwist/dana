@@ -2,6 +2,7 @@
 #define WAV_INCLUDED
 
 #include <stdint.h>
+#include <stdio.h>
 
 typedef int32_t WAVPcmData;
 
@@ -41,6 +42,8 @@ struct WAVFile* WAV_Create(const struct WAVFileFormat* format);
 void WAV_Destroy(struct WAVFile* wavfile);
 WAVApiResult WAV_WriteToFile(const char* filename, const struct WAVFile* wavfile);
 WAVApiResult WAV_GetWAVFormatFromFile(const char* filename, struct WAVFileFormat* format);
+WAVApiResult WAV_GetWAVFormatFromFP(FILE* fp, struct WAVFileFormat* format);
+WAVApiResult WAV_WriteWAVHeaderToFP(FILE* fp, const struct WAVFileFormat* format);
 
 #ifdef __cplusplus
 }

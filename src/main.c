@@ -12,9 +12,12 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
-// Should go in utility?
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define STREAM_RING_SLOTS 16
 
 static struct CommandLineParserSpecification command_line_spec[] = {
     { 'e', "encode", COMMAND_LINE_PARSER_FALSE, "Encode mode", NULL, COMMAND_LINE_PARSER_FALSE },
@@ -25,6 +28,7 @@ static struct CommandLineParserSpecification command_line_spec[] = {
     { 'q', "quiet", COMMAND_LINE_PARSER_FALSE, "Quiet mode(suppress outputs)", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'c', "crc-check", COMMAND_LINE_PARSER_TRUE, "Whether to check CRC16 at decoding(yes or no) default:yes", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'z', "seek-table", COMMAND_LINE_PARSER_TRUE, "Enable seek table generation (yes or no) default:yes", NULL, COMMAND_LINE_PARSER_FALSE },
+    { 't', "threads", COMMAND_LINE_PARSER_TRUE, "Number of worker threads (default: auto)", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'h', "help", COMMAND_LINE_PARSER_FALSE, "Show command help message", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'v', "version", COMMAND_LINE_PARSER_FALSE, "Show version information", NULL, COMMAND_LINE_PARSER_FALSE },
     { 's', "streaming", COMMAND_LINE_PARSER_FALSE, "Use streaming decode(for debug; 120fps)", NULL, COMMAND_LINE_PARSER_FALSE },
@@ -42,300 +46,630 @@ static struct CommandLineParserSpecification command_line_spec[] = {
 };
 
 static const struct DANAEncodeParameter encode_preset[] = {
-    {  8, 1, 4, DANA_CHPROCESSMETHOD_NONE,      DANA_WINDOWFUNCTIONTYPE_RECTANGULAR,  4096 },
-    {  8, 1, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288 },
-    { 16, 1, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288 },
-    { 32, 3, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288 },
-    { 40, 3, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       16384 }
+    {  8, 0, 4, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,        4096, 0 },
+    {  8, 0, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,        8192, 0 },
+    { 16, 1, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288, 1 },
+    { 32, 3, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288, 2 },
+    { 40, 3, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       16384, 2 }
 };
 
 static const uint32_t num_encode_preset = sizeof(encode_preset) / sizeof(encode_preset[0]);
 static const uint32_t default_preset_no = 2;
 
+enum SlotState { SLOT_EMPTY = 0, SLOT_QUEUED, SLOT_PROCESSING, SLOT_READY };
+
+typedef struct {
+    int32_t* pcm[DANA_MAX_CHANNELS];
+    uint32_t num_samples;
+    uint32_t seq_id;
+    uint32_t start_sample;
+    uint8_t* compressed;
+    uint32_t compressed_size;
+    uint32_t num_blocks;
+    uint32_t max_block_size;
+    uint32_t max_bps;
+    DANAApiResult res;
+    int state;
+} StreamSlot;
+
+typedef struct {
+    struct DANAWaveFormat wave_format;
+    struct DANAEncodeParameter enc_param;
+    StreamSlot slots[STREAM_RING_SLOTS];
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_empty;
+    pthread_cond_t cond_queued;
+    pthread_cond_t cond_ready;
+    bool reader_finished;
+    atomic_int error_code;
+    uint32_t queued_count;
+} StreamPipeContext;
+
+static void* stream_encode_worker(void* arg) {
+    StreamPipeContext* ctx = (StreamPipeContext*)arg;
+
+    struct DANAEncoderConfig cfg = {
+        .max_num_channels         = ctx->wave_format.num_channels,
+        .max_num_block_samples    = ctx->enc_param.max_num_block_samples,
+        .max_parcor_order         = ctx->enc_param.parcor_order,
+        .max_longterm_order       = ctx->enc_param.longterm_order,
+        .max_lms_order_per_filter = ctx->enc_param.lms_order_per_filter,
+        .verpose_flag             = 0,
+        .enable_seek_table        = 0,
+        .num_threads              = 1
+    };
+
+    struct DANAEncoder* enc = DANAEncoder_Create(&cfg);
+    if (!enc) return NULL;
+    DANAEncoder_SetWaveFormat(enc, &ctx->wave_format);
+    DANAEncoder_SetEncodeParameter(enc, &ctx->enc_param);
+
+    uint32_t max_buf = DANA_CalculateSufficientBlockSize(ctx->wave_format.num_channels, ctx->enc_param.max_num_block_samples, ctx->wave_format.bit_per_sample) + 8192;
+    uint8_t* tmp_buf = malloc(max_buf);
+
+    while (atomic_load(&ctx->error_code) == 0) {
+        pthread_mutex_lock(&ctx->mutex);
+        int slot_idx = -1;
+        while (!ctx->reader_finished || ctx->queued_count > 0) {
+            for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+                if (ctx->slots[i].state == SLOT_QUEUED) {
+                    slot_idx = i;
+                    ctx->slots[i].state = SLOT_PROCESSING;
+                    ctx->queued_count--;
+                    break;
+                }
+            }
+            if (slot_idx != -1 || (ctx->reader_finished && ctx->queued_count == 0)) break;
+            pthread_cond_wait(&ctx->cond_queued, &ctx->mutex);
+        }
+        pthread_mutex_unlock(&ctx->mutex);
+
+        if (slot_idx == -1) break;
+
+        StreamSlot* s = &ctx->slots[slot_idx];
+        const int32_t* input_ptr[DANA_MAX_CHANNELS];
+        for (uint32_t ch = 0; ch < ctx->wave_format.num_channels; ch++) input_ptr[ch] = s->pcm[ch];
+
+        uint32_t bsize = 0;
+        DANAApiResult ret = DANAEncoder_EncodeBlock(enc, input_ptr, s->num_samples, tmp_buf, max_buf, &bsize);
+        s->res = ret;
+        if (ret == DANA_APIRESULT_OK) {
+            memcpy(s->compressed, tmp_buf, bsize);
+            s->compressed_size = bsize;
+            s->num_blocks = 1;
+            s->max_block_size = bsize;
+            s->max_bps = (8 * bsize * ctx->wave_format.sampling_rate) / s->num_samples;
+        } else {
+            atomic_store(&ctx->error_code, ret);
+        }
+
+        pthread_mutex_lock(&ctx->mutex);
+        s->state = SLOT_READY;
+        pthread_cond_signal(&ctx->cond_ready);
+        pthread_mutex_unlock(&ctx->mutex);
+    }
+
+    free(tmp_buf);
+    DANAEncoder_Destroy(enc);
+    return NULL;
+}
+
 static int do_encode(const char* in_filename, const char* out_filename, uint32_t encode_preset_no, uint8_t verpose_flag, int hybrid_shift, uint8_t enable_seek_table) {
-    struct DANAEncoderConfig config = {
-        .max_num_channels = 8,
-        .max_num_block_samples = 16384,
-        .max_parcor_order = 48,
-        .max_longterm_order = 5,
-        .max_lms_order_per_filter = 40,
-        .verpose_flag = verpose_flag,
-        .enable_seek_table = enable_seek_table
-    };
+    (void)hybrid_shift;
+    bool is_in_pipe = (strcmp(in_filename, "-") == 0);
+    bool is_out_pipe = (strcmp(out_filename, "-") == 0);
 
-    struct DANAEncoder* encoder = DANAEncoder_Create(&config);
-    if (!encoder) {
-        fprintf(stderr, "Failed to create encoder handle.\n");
+    FILE* in_fp = is_in_pipe ? stdin : fopen(in_filename, "rb");
+    if (!in_fp) { fprintf(stderr, "Failed to open input: %s\n", in_filename); return 1; }
+    setvbuf(in_fp, NULL, _IOFBF, 256 * 1024);
+
+    struct WAVFileFormat wav_fmt;
+    if (WAV_GetWAVFormatFromFP(in_fp, &wav_fmt) != WAV_APIRESULT_OK) {
+        if (!is_in_pipe) fclose(in_fp);
         return 1;
     }
 
-    struct WAVFile* in_wav = WAV_CreateFromFile(in_filename);
-    if (!in_wav) {
-        fprintf(stderr, "Failed to open %s\n", in_filename);
-        DANAEncoder_Destroy(encoder);
-        return 1;
-    }
-
-    struct DANAWaveFormat wave_format = {
-        .num_channels = in_wav->format.num_channels,
-        .bit_per_sample = in_wav->format.bits_per_sample,
-        .sampling_rate = in_wav->format.sampling_rate
-    };
-    
-    if (DANAEncoder_SetWaveFormat(encoder, &wave_format) != DANA_APIRESULT_OK) {
-        fprintf(stderr, "Failed to set wave parameter.\n");
-        return 1;
-    }
+    FILE* out_fp = is_out_pipe ? stdout : fopen(out_filename, "wb");
+    if (!out_fp) { if (!is_in_pipe) fclose(in_fp); return 1; }
+    setvbuf(out_fp, NULL, _IOFBF, 256 * 1024);
 
     const struct DANAEncodeParameter* ppreset = &encode_preset[encode_preset_no];
     struct DANAEncodeParameter enc_param = *ppreset;
-    if (in_wav->format.num_channels == 2 && ppreset->ch_process_method == DANA_CHPROCESSMETHOD_STEREO_MS) {
+    if (wav_fmt.num_channels == 2 && ppreset->ch_process_method == DANA_CHPROCESSMETHOD_STEREO_MS) {
         enc_param.ch_process_method = DANA_CHPROCESSMETHOD_STEREO_MS;
     } else {
         enc_param.ch_process_method = DANA_CHPROCESSMETHOD_NONE;
     }
 
-    if (DANAEncoder_SetEncodeParameter(encoder, &enc_param) != DANA_APIRESULT_OK) {
-        fprintf(stderr, "Failed to set encode parameter.\n");
-        return 1;
+    struct DANAWaveFormat wave_fmt = {
+        .num_channels   = wav_fmt.num_channels,
+        .bit_per_sample = wav_fmt.bits_per_sample,
+        .sampling_rate  = wav_fmt.sampling_rate,
+        .offset_lshift  = 0
+    };
+
+    struct DANAHeaderInfo header;
+    memset(&header, 0, sizeof(header));
+    header.wave_format  = wave_fmt;
+    header.encode_param = enc_param;
+    header.num_samples  = wav_fmt.num_samples;
+
+    uint32_t header_buf_size = 1024 * 1024;
+    uint8_t* header_buf = malloc(header_buf_size);
+    uint32_t header_size = 0;
+    DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &header_size);
+    fwrite(header_buf, 1, header_size, out_fp);
+
+    uint32_t chunk_samples = enc_param.max_num_block_samples;
+    uint32_t max_buf = DANA_CalculateSufficientBlockSize(wave_fmt.num_channels, chunk_samples, wave_fmt.bit_per_sample) + 8192;
+
+    StreamPipeContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.wave_format = wave_fmt;
+    ctx.enc_param   = enc_param;
+    pthread_mutex_init(&ctx.mutex, NULL);
+    pthread_cond_init(&ctx.cond_empty, NULL);
+    pthread_cond_init(&ctx.cond_queued, NULL);
+    pthread_cond_init(&ctx.cond_ready, NULL);
+
+    for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+        for (uint32_t ch = 0; ch < wave_fmt.num_channels; ch++) {
+            ctx.slots[i].pcm[ch] = malloc(sizeof(int32_t) * chunk_samples);
+        }
+        ctx.slots[i].compressed = malloc(max_buf);
+        ctx.slots[i].state = SLOT_EMPTY;
     }
 
-    struct DANAMetadata meta;
-    DANAMetadata_Init(&meta);
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "title")) meta.title = (char*)CommandLineParser_GetArgumentString(command_line_spec, "title");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "artist")) meta.artist = (char*)CommandLineParser_GetArgumentString(command_line_spec, "artist");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "album")) meta.album = (char*)CommandLineParser_GetArgumentString(command_line_spec, "album");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "year")) meta.year = (char*)CommandLineParser_GetArgumentString(command_line_spec, "year");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "genre")) meta.genre = (char*)CommandLineParser_GetArgumentString(command_line_spec, "genre");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "track")) meta.track = (char*)CommandLineParser_GetArgumentString(command_line_spec, "track");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "bpm")) meta.bpm = (char*)CommandLineParser_GetArgumentString(command_line_spec, "bpm");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "key")) meta.key = (char*)CommandLineParser_GetArgumentString(command_line_spec, "key");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "lyrics")) meta.lyrics = (char*)CommandLineParser_GetArgumentString(command_line_spec, "lyrics");
-    
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "cover")) {
-        const char* cover_path = CommandLineParser_GetArgumentString(command_line_spec, "cover");
-        FILE* f = fopen(cover_path, "rb");
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            long file_size = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            if (file_size > 20 * 1024 * 1024) {
-                fprintf(stderr, "Warning: Cover image %s is too large (%.2f MB). Max allowed is 20 MB. Skipping cover.\n", cover_path, (double)file_size / (1024 * 1024));
-            } else {
-                meta.cover_size = (uint32_t)file_size;
-                meta.cover_data = malloc(meta.cover_size);
-                if (meta.cover_data) fread(meta.cover_data, 1, meta.cover_size, f);
+    uint32_t num_threads = 0;
+    if (CommandLineParser_GetOptionAcquired(command_line_spec, "threads")) {
+        num_threads = (uint32_t)atoi(CommandLineParser_GetArgumentString(command_line_spec, "threads"));
+    }
+    if (num_threads == 0) {
+        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+    }
+    if (num_threads > 64) num_threads = 64;
+
+    pthread_t worker_threads[64];
+    for (uint32_t i = 0; i < num_threads; i++) {
+        pthread_create(&worker_threads[i], NULL, stream_encode_worker, &ctx);
+    }
+
+    uint32_t frame_bytes = (wav_fmt.bits_per_sample / 8) * wav_fmt.num_channels;
+    uint8_t* raw_io_buf = malloc(chunk_samples * frame_bytes);
+
+    uint32_t seq_in = 0, seq_out = 0;
+    uint32_t sample_pos = 0;
+    uint32_t total_blocks = 0, max_block_size = 0, max_bps = 0;
+    uint32_t audio_bytes_written = 0;
+
+    bool reached_eof = false;
+
+    while (!reached_eof || seq_out < seq_in) {
+        if (!reached_eof) {
+            pthread_mutex_lock(&ctx.mutex);
+            int slot_idx = -1;
+            for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+                if (ctx.slots[i].state == SLOT_EMPTY) { slot_idx = i; break; }
             }
-            fclose(f);
-        } else {
-            fprintf(stderr, "Warning: Could not open cover image %s\n", cover_path);
-        }
-    }
+            pthread_mutex_unlock(&ctx.mutex);
 
-    if (DANAEncoder_SetMetadata(encoder, &meta) != DANA_APIRESULT_OK) {
-        fprintf(stderr, "Failed to set metadata.\n");
-    }
-    
-    struct stat fstat;
-    stat(in_filename, &fstat);
-    uint32_t buffer_size = (uint32_t)(2 * fstat.st_size) + meta.cover_size + (1024 * 1024);
-    uint8_t* buffer = malloc(buffer_size);
+            if (slot_idx != -1) {
+                uint32_t to_read = chunk_samples;
+                if (wav_fmt.num_samples != DANA_NUM_SAMPLES_INVALID) {
+                    uint32_t remaining = wav_fmt.num_samples - sample_pos;
+                    if (to_read > remaining) to_read = remaining;
+                }
 
-    if (hybrid_shift > 0) {
-        char file_dahl[1024], file_dahc[1024];
-        strcpy(file_dahl, out_filename);
-        char* dot = strrchr(file_dahl, '.');
-        if (dot && (strcmp(dot, ".dahl") == 0 || strcmp(dot, ".dahc") == 0 || strcmp(dot, ".dana") == 0)) *dot = '\0';
-        strcpy(file_dahc, file_dahl);
-        strcat(file_dahl, ".dahl"); strcat(file_dahc, ".dahc");
+                if (to_read == 0) {
+                    reached_eof = true;
+                    pthread_mutex_lock(&ctx.mutex);
+                    ctx.reader_finished = true;
+                    pthread_cond_broadcast(&ctx.cond_queued);
+                    pthread_mutex_unlock(&ctx.mutex);
+                } else {
+                    size_t n_read = fread(raw_io_buf, frame_bytes, to_read, in_fp);
+                    if (n_read > 0) {
+                        StreamSlot* s = &ctx.slots[slot_idx];
+                        s->num_samples  = (uint32_t)n_read;
+                        s->seq_id       = seq_in++;
+                        s->start_sample = sample_pos;
+                        sample_pos     += (uint32_t)n_read;
 
-        struct WAVFile* lossy_wav = WAV_Create(&in_wav->format);
-        struct WAVFile* corr_wav = WAV_Create(&in_wav->format);
+                        if (wav_fmt.bits_per_sample == 16) {
+                            const int16_t* src16 = (const int16_t*)raw_io_buf;
+                            for (size_t smp = 0; smp < n_read; smp++) {
+                                for (uint32_t ch = 0; ch < wave_fmt.num_channels; ch++) {
+                                    s->pcm[ch][smp] = (int32_t)src16[smp * wave_fmt.num_channels + ch] << 16;
+                                }
+                            }
+                        } else if (wav_fmt.bits_per_sample == 24) {
+                            const uint8_t* p = raw_io_buf;
+                            for (size_t smp = 0; smp < n_read; smp++) {
+                                for (uint32_t ch = 0; ch < wave_fmt.num_channels; ch++) {
+                                    uint32_t b0 = *p++; uint32_t b1 = *p++; uint32_t b2 = *p++;
+                                    s->pcm[ch][smp] = (int32_t)((b2 << 24) | (b1 << 16) | (b0 << 8));
+                                }
+                            }
+                        }
 
-        uint32_t physical_shift = (32 - in_wav->format.bits_per_sample) + hybrid_shift;
-        int32_t offset = (1 << (physical_shift - 1));
+                        pthread_mutex_lock(&ctx.mutex);
+                        s->state = SLOT_QUEUED;
+                        ctx.queued_count++;
+                        pthread_cond_signal(&ctx.cond_queued);
+                        pthread_mutex_unlock(&ctx.mutex);
 
-        for (uint32_t smpl = 0; smpl < in_wav->format.num_samples; smpl++) {
-            for (uint32_t ch = 0; ch < in_wav->format.num_channels; ch++) {
-                int32_t orig = in_wav->data[ch][smpl];
-                int64_t lossy64 = (((int64_t)orig + offset) >> physical_shift) << physical_shift;
-                if (lossy64 > 2147483647LL) lossy64 = ((2147483647LL) >> physical_shift) << physical_shift;
-                if (lossy64 < -2147483648LL) lossy64 = ((-2147483648LL) >> physical_shift) << physical_shift;
-                lossy_wav->data[ch][smpl] = (int32_t)lossy64;
-                corr_wav->data[ch][smpl] = orig - (int32_t)lossy64;
+                        if (wav_fmt.num_samples != DANA_NUM_SAMPLES_INVALID && sample_pos >= wav_fmt.num_samples) {
+                            reached_eof = true;
+                            pthread_mutex_lock(&ctx.mutex);
+                            ctx.reader_finished = true;
+                            pthread_cond_broadcast(&ctx.cond_queued);
+                            pthread_mutex_unlock(&ctx.mutex);
+                        }
+                    } else {
+                        reached_eof = true;
+                        pthread_mutex_lock(&ctx.mutex);
+                        ctx.reader_finished = true;
+                        pthread_cond_broadcast(&ctx.cond_queued);
+                        pthread_mutex_unlock(&ctx.mutex);
+                    }
+                }
             }
         }
 
-        uint32_t enc_size = 0;
-        DANAApiResult ret = DANAEncoder_EncodeWhole(encoder, (const int32_t* const*)lossy_wav->data, lossy_wav->format.num_samples, buffer, buffer_size, &enc_size);
-        if (ret == DANA_APIRESULT_OK) {
-            FILE* fp = fopen(file_dahl, "wb");
-            if (fp) { fwrite(buffer, 1, enc_size, fp); fclose(fp); }
+        pthread_mutex_lock(&ctx.mutex);
+        int emit_idx = -1;
+        for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+            if (ctx.slots[i].state == SLOT_READY && ctx.slots[i].seq_id == seq_out) {
+                emit_idx = i;
+                break;
+            }
         }
 
-        DANAEncoder_Destroy(encoder);
-        encoder = DANAEncoder_Create(&config);
-        DANAEncoder_SetWaveFormat(encoder, &wave_format);
-        DANAEncoder_SetEncodeParameter(encoder, &enc_param);
-        DANAEncoder_SetMetadata(encoder, &meta);
-
-        ret = DANAEncoder_EncodeWhole(encoder, (const int32_t* const*)corr_wav->data, corr_wav->format.num_samples, buffer, buffer_size, &enc_size);
-        if (ret == DANA_APIRESULT_OK) {
-            FILE* fp = fopen(file_dahc, "wb");
-            if (fp) { fwrite(buffer, 1, enc_size, fp); fclose(fp); }
+        if (emit_idx == -1) {
+            if (seq_out < seq_in) {
+                pthread_cond_wait(&ctx.cond_ready, &ctx.mutex);
+            }
+            pthread_mutex_unlock(&ctx.mutex);
+            continue;
         }
+        pthread_mutex_unlock(&ctx.mutex);
 
-        if (verpose_flag) printf("Dana Hybrid created %s and %s\n", file_dahl, file_dahc);
-        WAV_Destroy(lossy_wav); WAV_Destroy(corr_wav);
-    } else {
-        uint32_t encoded_data_size = 0;
-        DANAApiResult ret = DANAEncoder_EncodeWhole(encoder, (const int32_t* const*)in_wav->data, in_wav->format.num_samples, buffer, buffer_size, &encoded_data_size);
-        if (ret != DANA_APIRESULT_OK) {
-            fprintf(stderr, "Encoding error! %d\n", ret);
-            free(buffer); WAV_Destroy(in_wav); DANAEncoder_Destroy(encoder);
-            return 1;
-        }
+        StreamSlot* s = &ctx.slots[emit_idx];
+        fwrite(s->compressed, 1, s->compressed_size, out_fp);
+        audio_bytes_written += s->compressed_size;
+        total_blocks        += s->num_blocks;
+        if (s->max_block_size > max_block_size) max_block_size = s->max_block_size;
+        if (s->max_bps > max_bps) max_bps = s->max_bps;
 
-        FILE* out_fp = fopen(out_filename, "wb");
-        if (out_fp) { fwrite(buffer, 1, encoded_data_size, out_fp); fclose(out_fp); }
-
-        if (verpose_flag) printf("Encode success! size: %u -> %u\n", (uint32_t)fstat.st_size, encoded_data_size);
+        pthread_mutex_lock(&ctx.mutex);
+        s->state = SLOT_EMPTY;
+        seq_out++;
+        pthread_cond_signal(&ctx.cond_empty);
+        pthread_mutex_unlock(&ctx.mutex);
     }
 
-    if (meta.cover_data) free(meta.cover_data);
-    free(buffer);
-    WAV_Destroy(in_wav);
-    DANAEncoder_Destroy(encoder);
+    for (uint32_t i = 0; i < num_threads; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+
+    // Finalize header with counts on seekable streams
+    if (!is_out_pipe) {
+        header.num_samples        = sample_pos;
+        header.num_blocks         = total_blocks;
+        header.max_block_size     = max_block_size;
+        header.max_bit_per_second = max_bps;
+
+        fseek(out_fp, 0, SEEK_SET);
+        DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &header_size);
+        fwrite(header_buf, 1, header_size, out_fp);
+    }
+
+    if (verpose_flag) {
+        fprintf(stderr, "Encode success! size: -> %u bytes\n", header_size + audio_bytes_written);
+    }
+
+    free(raw_io_buf);
+    free(header_buf);
+    for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+        for (uint32_t ch = 0; ch < wave_fmt.num_channels; ch++) free(ctx.slots[i].pcm[ch]);
+        free(ctx.slots[i].compressed);
+    }
+
+    if (!is_in_pipe) fclose(in_fp);
+    if (!is_out_pipe) fclose(out_fp);
     return 0;
 }
 
-static int do_decode(const char* in_filename, const char* out_filename, uint8_t enable_crc_check, uint8_t verpose_flag) {
-    struct DANADecoderConfig config = {
-        .max_num_channels = 8,
-        .max_num_block_samples = 16384,
-        .max_parcor_order = 48,
-        .max_longterm_order = 5,
-        .max_lms_order_per_filter = 40,
-        .enable_crc_check = enable_crc_check,
-        .verpose_flag = verpose_flag
+typedef struct {
+    struct DANAWaveFormat wave_format;
+    struct DANAEncodeParameter enc_param;
+    uint8_t enable_crc_check;
+    StreamSlot slots[STREAM_RING_SLOTS];
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_empty;
+    pthread_cond_t cond_queued;
+    pthread_cond_t cond_ready;
+    bool reader_finished;
+    atomic_int error_code;
+    uint32_t queued_count;
+} StreamDecodeContext;
+
+static void* stream_decode_worker(void* arg) {
+    StreamDecodeContext* ctx = (StreamDecodeContext*)arg;
+
+    struct DANADecoderConfig cfg = {
+        .max_num_channels         = ctx->wave_format.num_channels,
+        .max_num_block_samples    = ctx->enc_param.max_num_block_samples,
+        .max_parcor_order         = ctx->enc_param.parcor_order,
+        .max_longterm_order       = ctx->enc_param.longterm_order,
+        .max_lms_order_per_filter = ctx->enc_param.lms_order_per_filter,
+        .enable_crc_check         = ctx->enable_crc_check,
+        .verpose_flag             = 0,
+        .num_threads              = 1
     };
 
-    struct DANADecoder* decoder = DANADecoder_Create(&config);
-    if (!decoder) {
-        fprintf(stderr, "Failed to create decoder handle.\n");
-        return 1;
-    }
+    struct DANADecoder* dec = DANADecoder_Create(&cfg);
+    if (!dec) return NULL;
+    DANADecoder_SetWaveFormat(dec, &ctx->wave_format);
+    DANADecoder_SetEncodeParameter(dec, &ctx->enc_param);
 
-    FILE* in_fp = fopen(in_filename, "rb");
-    if (!in_fp) {
-        DANADecoder_Destroy(decoder);
-        return 1;
-    }
-
-    struct stat fstat;
-    stat(in_filename, &fstat);
-    uint32_t buffer_size = (uint32_t)fstat.st_size;
-    uint8_t* buffer = malloc(buffer_size);
-    fread(buffer, 1, buffer_size, in_fp);
-    fclose(in_fp);
-
-    struct DANAHeaderInfo header = {0};
-    uint32_t parsed_header_size = 0;
-    if (DANADecoder_DecodeHeader(buffer, buffer_size, &header, &parsed_header_size) != DANA_APIRESULT_OK) {
-        fprintf(stderr, "Failed to get header information.\n");
-        free(buffer);
-        DANADecoder_Destroy(decoder);
-        return 1;
-    }
-
-    // Why verpose instead of verbose?, able to use -p
-    if (verpose_flag) {
-        if (header.metadata.title) printf("Title: %s\n", header.metadata.title);
-        if (header.metadata.artist) printf("Artist: %s\n", header.metadata.artist);
-        printf("Num Channels:                %u\n", header.wave_format.num_channels);
-        printf("Bit Per Sample:              %u\n", header.wave_format.bit_per_sample);
-        printf("Sampling Rate:               %u\n", header.wave_format.sampling_rate);
-        if (header.metadata.seek_table) printf("Seek Table:                  Available (%u bytes)\n", header.metadata.seek_table_size);
-    }
-
-    struct WAVFileFormat wav_format = {
-        .data_format = WAV_DATA_FORMAT_PCM,
-        .num_channels = header.wave_format.num_channels,
-        .sampling_rate = header.wave_format.sampling_rate,
-        .bits_per_sample = header.wave_format.bit_per_sample,
-        .num_samples = header.num_samples
-    };
-
-    struct WAVFile* out_wav = WAV_Create(&wav_format);
-    if (!out_wav) {
-        fprintf(stderr, "Failed to create wav handle.\n");
-        free(buffer);
-        DANADecoder_Destroy(decoder);
-        return 1;
-    }
-
-    DANADecoder_SetWaveFormat(decoder, &header.wave_format);
-    DANADecoder_SetEncodeParameter(decoder, &header.encode_param);
-
-    uint32_t decode_num_samples = 0;
-    if (DANADecoder_DecodeWhole(decoder, buffer, buffer_size, (int32_t**)out_wav->data, out_wav->format.num_samples, &decode_num_samples) != DANA_APIRESULT_OK) {
-        fprintf(stderr, "Decoding error!\n");
-        free(buffer); WAV_Destroy(out_wav); DANADecoder_Destroy(decoder);
-        return 1;
-    }
-
-    int hybrid_mode = 0;
-    char dahc_filepath[1024];
-    size_t len = strlen(in_filename);
-    if (len > 5 && strcasecmp(in_filename + len - 5, ".dahl") == 0) {
-        strcpy(dahc_filepath, in_filename);
-        strcpy(dahc_filepath + len - 5, ".dahc");
-        FILE* fp_corr = fopen(dahc_filepath, "rb");
-        if (fp_corr) { hybrid_mode = 1; fclose(fp_corr); }
-    }
-
-    if (hybrid_mode) {
-        FILE* fp_corr = fopen(dahc_filepath, "rb");
-        if (fp_corr) {
-            struct stat fstat_corr;
-            stat(dahc_filepath, &fstat_corr);
-            uint32_t buf_size_corr = (uint32_t)fstat_corr.st_size;
-            uint8_t* buf_corr = malloc(buf_size_corr);
-            fread(buf_corr, 1, buf_size_corr, fp_corr);
-            fclose(fp_corr);
-
-            struct DANADecoder* dec_corr = DANADecoder_Create(&config);
-            struct DANAHeaderInfo hdr_corr = {0};
-            uint32_t parsed_hdr_corr = 0;
-            if (DANADecoder_DecodeHeader(buf_corr, buf_size_corr, &hdr_corr, &parsed_hdr_corr) == DANA_APIRESULT_OK) {
-                struct WAVFile* wav_corr = WAV_Create(&wav_format);
-                DANADecoder_SetWaveFormat(dec_corr, &hdr_corr.wave_format);
-                DANADecoder_SetEncodeParameter(dec_corr, &hdr_corr.encode_param);
-                uint32_t dec_samples_corr = 0;
-                if (DANADecoder_DecodeWhole(dec_corr, buf_corr, buf_size_corr, (int32_t**)wav_corr->data, wav_corr->format.num_samples, &dec_samples_corr) == DANA_APIRESULT_OK) {
-                    for (uint32_t ch = 0; ch < out_wav->format.num_channels; ch++) {
-                        for (uint32_t s = 0; s < dec_samples_corr && s < decode_num_samples; s++) {
-                            out_wav->data[ch][s] += wav_corr->data[ch][s];
-                        }
-                    }
-                    if (verpose_flag) printf("Applied hybrid lossless corrections from %s\n", dahc_filepath);
+    while (atomic_load(&ctx->error_code) == 0) {
+        pthread_mutex_lock(&ctx->mutex);
+        int slot_idx = -1;
+        while (!ctx->reader_finished || ctx->queued_count > 0) {
+            for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+                if (ctx->slots[i].state == SLOT_QUEUED) {
+                    slot_idx = i;
+                    ctx->slots[i].state = SLOT_PROCESSING;
+                    ctx->queued_count--;
+                    break;
                 }
-                WAV_Destroy(wav_corr);
-                DANAMetadata_Release(&hdr_corr.metadata);
             }
-            DANADecoder_Destroy(dec_corr);
-            free(buf_corr);
+            if (slot_idx != -1 || (ctx->reader_finished && ctx->queued_count == 0)) break;
+            pthread_cond_wait(&ctx->cond_queued, &ctx->mutex);
+        }
+        pthread_mutex_unlock(&ctx->mutex);
+
+        if (slot_idx == -1) break;
+
+        StreamSlot* s = &ctx->slots[slot_idx];
+        int32_t* out_ptr[DANA_MAX_CHANNELS];
+        for (uint32_t ch = 0; ch < ctx->wave_format.num_channels; ch++) out_ptr[ch] = s->pcm[ch];
+
+        uint32_t out_bsize = 0, out_nsamples = 0;
+        DANAApiResult ret = DANADecoder_DecodeBlock(
+            dec, s->compressed, s->compressed_size,
+            out_ptr, ctx->enc_param.max_num_block_samples,
+            &out_bsize, &out_nsamples);
+
+        s->num_samples = out_nsamples;
+        s->res = ret;
+        if (ret != DANA_APIRESULT_OK) {
+            atomic_store(&ctx->error_code, ret);
+        }
+
+        pthread_mutex_lock(&ctx->mutex);
+        s->state = SLOT_READY;
+        pthread_cond_signal(&ctx->cond_ready);
+        pthread_mutex_unlock(&ctx->mutex);
+    }
+
+    DANADecoder_Destroy(dec);
+    return NULL;
+}
+
+static int do_decode(const char* in_filename, const char* out_filename, uint8_t enable_crc_check, uint8_t verpose_flag) {
+    bool is_in_pipe = (strcmp(in_filename, "-") == 0);
+    bool is_out_pipe = (strcmp(out_filename, "-") == 0);
+
+    FILE* in_fp = is_in_pipe ? stdin : fopen(in_filename, "rb");
+    if (!in_fp) { fprintf(stderr, "Failed to open %s\n", in_filename); return 1; }
+    setvbuf(in_fp, NULL, _IOFBF, 256 * 1024);
+
+    uint8_t header_buf[43];
+    if (fread(header_buf, 1, 43, in_fp) < 43) { if (!is_in_pipe) fclose(in_fp); return 1; }
+    uint32_t offset = (((uint32_t)header_buf[4] << 24) | ((uint32_t)header_buf[5] << 16) | ((uint32_t)header_buf[6] << 8) | header_buf[7]);
+    uint32_t full_hdr_size = offset + 8;
+
+    uint8_t* full_hdr = malloc(full_hdr_size);
+    memcpy(full_hdr, header_buf, 43);
+    if (full_hdr_size > 43) {
+        if (fread(full_hdr + 43, 1, full_hdr_size - 43, in_fp) < full_hdr_size - 43) {
+            free(full_hdr); if (!is_in_pipe) fclose(in_fp); return 1;
         }
     }
 
-    if (WAV_WriteToFile(out_filename, out_wav) != WAV_APIRESULT_OK) {
-        fprintf(stderr, "Failed to write wav file.\n");
+    struct DANAHeaderInfo header;
+    if (DANADecoder_DecodeHeader(full_hdr, full_hdr_size, &header, NULL) != DANA_APIRESULT_OK) {
+        free(full_hdr); if (!is_in_pipe) fclose(in_fp); return 1;
+    }
+    free(full_hdr);
+
+    if (verpose_flag) {
+        printf("Num Channels:                %u\n", header.wave_format.num_channels);
+        printf("Bit Per Sample:              %u\n", header.wave_format.bit_per_sample);
+        printf("Sampling Rate:               %u\n", header.wave_format.sampling_rate);
     }
 
-    free(buffer);
-    WAV_Destroy(out_wav);
-    DANADecoder_Destroy(decoder);
+    FILE* out_fp = is_out_pipe ? stdout : fopen(out_filename, "wb");
+    if (!out_fp) { if (!is_in_pipe) fclose(in_fp); return 1; }
+    setvbuf(out_fp, NULL, _IOFBF, 256 * 1024);
+
+    struct WAVFileFormat wav_fmt = {
+        .data_format     = WAV_DATA_FORMAT_PCM,
+        .num_channels    = header.wave_format.num_channels,
+        .sampling_rate   = header.wave_format.sampling_rate,
+        .bits_per_sample = header.wave_format.bit_per_sample,
+        .num_samples     = header.num_samples
+    };
+
+    WAV_WriteWAVHeaderToFP(out_fp, &wav_fmt);
+
+    uint32_t chunk_samples = header.encode_param.max_num_block_samples;
+    uint32_t max_buf = DANA_CalculateSufficientBlockSize(header.wave_format.num_channels, chunk_samples, header.wave_format.bit_per_sample) + 8192;
+
+    StreamDecodeContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.wave_format      = header.wave_format;
+    ctx.enc_param        = header.encode_param;
+    ctx.enable_crc_check = enable_crc_check;
+    pthread_mutex_init(&ctx.mutex, NULL);
+    pthread_cond_init(&ctx.cond_empty, NULL);
+    pthread_cond_init(&ctx.cond_queued, NULL);
+    pthread_cond_init(&ctx.cond_ready, NULL);
+
+    for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+        for (uint32_t ch = 0; ch < header.wave_format.num_channels; ch++) {
+            ctx.slots[i].pcm[ch] = malloc(sizeof(int32_t) * chunk_samples);
+        }
+        ctx.slots[i].compressed = malloc(max_buf);
+        ctx.slots[i].state = SLOT_EMPTY;
+    }
+
+    uint32_t num_threads = 0;
+    if (CommandLineParser_GetOptionAcquired(command_line_spec, "threads")) {
+        num_threads = (uint32_t)atoi(CommandLineParser_GetArgumentString(command_line_spec, "threads"));
+    }
+    if (num_threads == 0) {
+        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+    }
+    if (num_threads > 64) num_threads = 64;
+
+    pthread_t worker_threads[64];
+    for (uint32_t i = 0; i < num_threads; i++) {
+        pthread_create(&worker_threads[i], NULL, stream_decode_worker, &ctx);
+    }
+
+    uint32_t frame_bytes = (header.wave_format.bit_per_sample / 8) * header.wave_format.num_channels;
+    uint8_t* raw_io_buf = malloc(chunk_samples * frame_bytes);
+
+    uint32_t seq_in = 0, seq_out = 0;
+    uint32_t total_samples_decoded = 0;
+    bool reached_eof = false;
+
+    while (!reached_eof || seq_out < seq_in) {
+        /* Read next compressed block if space in ring */
+        if (!reached_eof) {
+            pthread_mutex_lock(&ctx.mutex);
+            int slot_idx = -1;
+            for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+                if (ctx.slots[i].state == SLOT_EMPTY) { slot_idx = i; break; }
+            }
+            pthread_mutex_unlock(&ctx.mutex);
+
+            if (slot_idx != -1) {
+                uint8_t b_hdr[5];
+                size_t n = fread(b_hdr, 1, 5, in_fp);
+                if (n == 5) {
+                    uint16_t sync = ((uint16_t)b_hdr[0] << 8) | b_hdr[1];
+                    if (sync == DANA_BLOCK_SYNC_CODE) {
+                        uint32_t bsize = (((uint32_t)b_hdr[2] << 16) | ((uint32_t)b_hdr[3] << 8) | b_hdr[4]) + 5;
+                        StreamSlot* s = &ctx.slots[slot_idx];
+                        memcpy(s->compressed, b_hdr, 5);
+                        if (fread(s->compressed + 5, 1, bsize - 5, in_fp) == bsize - 5) {
+                            s->compressed_size = bsize;
+                            s->seq_id          = seq_in++;
+
+                            pthread_mutex_lock(&ctx.mutex);
+                            s->state = SLOT_QUEUED;
+                            ctx.queued_count++;
+                            pthread_cond_signal(&ctx.cond_queued);
+                            pthread_mutex_unlock(&ctx.mutex);
+                        } else {
+                            reached_eof = true;
+                            pthread_mutex_lock(&ctx.mutex);
+                            ctx.reader_finished = true;
+                            pthread_cond_broadcast(&ctx.cond_queued);
+                            pthread_mutex_unlock(&ctx.mutex);
+                        }
+                    } else {
+                        reached_eof = true;
+                        pthread_mutex_lock(&ctx.mutex);
+                        ctx.reader_finished = true;
+                        pthread_cond_broadcast(&ctx.cond_queued);
+                        pthread_mutex_unlock(&ctx.mutex);
+                    }
+                } else {
+                    reached_eof = true;
+                    pthread_mutex_lock(&ctx.mutex);
+                    ctx.reader_finished = true;
+                    pthread_cond_broadcast(&ctx.cond_queued);
+                    pthread_mutex_unlock(&ctx.mutex);
+                }
+            }
+        }
+
+        // Emit PCM in strict sequential order
+        pthread_mutex_lock(&ctx.mutex);
+        int emit_idx = -1;
+        for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+            if (ctx.slots[i].state == SLOT_READY && ctx.slots[i].seq_id == seq_out) {
+                emit_idx = i;
+                break;
+            }
+        }
+
+        if (emit_idx == -1) {
+            if (seq_out < seq_in) {
+                pthread_cond_wait(&ctx.cond_ready, &ctx.mutex);
+            }
+            pthread_mutex_unlock(&ctx.mutex);
+            continue;
+        }
+        pthread_mutex_unlock(&ctx.mutex);
+
+        StreamSlot* s = &ctx.slots[emit_idx];
+        if (header.wave_format.bit_per_sample == 16) {
+            int16_t* dst16 = (int16_t*)raw_io_buf;
+            for (uint32_t smp = 0; smp < s->num_samples; smp++) {
+                for (uint32_t ch = 0; ch < header.wave_format.num_channels; ch++) {
+                    dst16[smp * header.wave_format.num_channels + ch] = (int16_t)(s->pcm[ch][smp] >> 16);
+                }
+            }
+        } else if (header.wave_format.bit_per_sample == 24) {
+            uint8_t* p = raw_io_buf;
+            for (uint32_t smp = 0; smp < s->num_samples; smp++) {
+                for (uint32_t ch = 0; ch < header.wave_format.num_channels; ch++) {
+                    int32_t v = s->pcm[ch][smp] >> 8;
+                    *p++ = (uint8_t)(v & 0xFF);
+                    *p++ = (uint8_t)((v >> 8) & 0xFF);
+                    *p++ = (uint8_t)((v >> 16) & 0xFF);
+                }
+            }
+        }
+
+        fwrite(raw_io_buf, frame_bytes, s->num_samples, out_fp);
+        total_samples_decoded += s->num_samples;
+
+        pthread_mutex_lock(&ctx.mutex);
+        s->state = SLOT_EMPTY;
+        seq_out++;
+        pthread_cond_signal(&ctx.cond_empty);
+        pthread_mutex_unlock(&ctx.mutex);
+    }
+
+    for (uint32_t i = 0; i < num_threads; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+
+    // Finalize WAV header sample count on seekable files
+    if (!is_out_pipe) {
+        wav_fmt.num_samples = total_samples_decoded;
+        fseek(out_fp, 0, SEEK_SET);
+        WAV_WriteWAVHeaderToFP(out_fp, &wav_fmt);
+    }
+
+    free(raw_io_buf);
+    for (int i = 0; i < STREAM_RING_SLOTS; i++) {
+        for (uint32_t ch = 0; ch < header.wave_format.num_channels; ch++) free(ctx.slots[i].pcm[ch]);
+        free(ctx.slots[i].compressed);
+    }
+
     DANAMetadata_Release(&header.metadata);
+    if (!is_in_pipe) fclose(in_fp);
+    if (!is_out_pipe) fclose(out_fp);
     return 0;
 }
 
@@ -455,7 +789,8 @@ static void print_usage(char** argv) {
 }
 
 static void print_version_info(void) {
-    printf("DANA - Dana Audio Non-lossy Archive Version %s\n", DANA_VERSION_STRING);
+    printf("DANA - Digital Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
+    printf("Copyright (c) 2026 holotwist. All rights reserved.\n");
 }
 
 int main(int argc, char** argv) {
@@ -497,6 +832,11 @@ int main(int argc, char** argv) {
 
     if (CommandLineParser_GetOptionAcquired(command_line_spec, "verpose")) verbose_flag = 1;
     else if (CommandLineParser_GetOptionAcquired(command_line_spec, "quiet")) verbose_flag = 0;
+
+    if (verbose_flag) {
+        fprintf(stderr, "DANA - Digital Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
+        fprintf(stderr, "Copyright (c) 2026 holotwist. All rights reserved.\n\n");
+    }
 
     if (CommandLineParser_GetOptionAcquired(command_line_spec, "decode")) {
         uint8_t enable_crc_check = 1;

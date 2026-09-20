@@ -1,0 +1,25 @@
+Dana (Digital Audio Non-lossy Archive)
+Copyright 2026 holotwist
+
+DANA (Dana or dana) is a lossless audio codec.
+This product includes software developed by holotwist.
+
+--- Third-Party Software Attributions ---
+
+1. miniaudio
+   Location: src/include/public/thirdparty/miniaudio.h
+   Author: David Reid
+   License: Public Domain (Unlicense) / MIT-0
+
+2. Hacker's Delight Bit-Manipulation Algorithms
+   Location: src/DANAUtility.c
+   Author: Henry S. Warren, Jr.
+   License: Free / Public Domain
+
+3. SLA Codec
+   Location: Codec base structure and file layout templating
+   Author: Aikiriao
+   License: WTFPL
+   Note: Provided the foundational inspiration for project layout, code formatting,
+   early algorithmic experimentation, and CLI interface. Dana is an independent implementation
+   and is neither bitstream-compatible nor format-compatible with SLA.

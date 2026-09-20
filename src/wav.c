@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdbool.h>
 
 #define WAVBITBUFFER_BUFFER_SIZE (10 * 1024)
 
@@ -166,46 +167,153 @@ static WAVError WAVParser_GetWAVFormat(struct WAVParser* parser, struct WAVFileF
     return WAV_ERROR_OK;
 }
 
-static int32_t WAV_Convert8bitPCMto32bitPCM(int32_t in_8bit)   { return (in_8bit - 128) << 24; }
-static int32_t WAV_Convert16bitPCMto32bitPCM(int32_t in_16bit) { return in_16bit << 16; }
-static int32_t WAV_Convert24bitPCMto32bitPCM(int32_t in_24bit) { return in_24bit << 8; }
-static int32_t WAV_Convert32bitPCMto32bitPCM(int32_t in_32bit) { return in_32bit; }
-static int32_t WAV_Convert32bitPCMto8bitPCM(int32_t in_32bit)  { return ((in_32bit >> 24) + 128); }
-static int32_t WAV_Convert32bitPCMto16bitPCM(int32_t in_32bit) { return (in_32bit >> 16); }
-static int32_t WAV_Convert32bitPCMto24bitPCM(int32_t in_32bit) { return (in_32bit >> 8); }
+// Direct conversion handles 8/16/24/32-bit inline
 
 static WAVError WAVParser_GetWAVPcmData(struct WAVParser* parser, struct WAVFile* wavfile) {
     if (parser == NULL || wavfile == NULL) return WAV_ERROR_INVALID_PARAMETER;
 
-    int32_t (*conv_func)(int32_t) = NULL;
-    switch (wavfile->format.bits_per_sample) {
-        case 8:  conv_func = WAV_Convert8bitPCMto32bitPCM; break;
-        case 16: conv_func = WAV_Convert16bitPCMto32bitPCM; break;
-        case 24: conv_func = WAV_Convert24bitPCMto32bitPCM; break;
-        case 32: conv_func = WAV_Convert32bitPCMto32bitPCM; break;
-        default: return WAV_ERROR_INVALID_FORMAT;
+    WAVParser_Seek(parser, 0, SEEK_CUR);
+
+    uint32_t num_channels = wavfile->format.num_channels;
+    uint32_t num_samples = wavfile->format.num_samples;
+    uint32_t bits_per_sample = wavfile->format.bits_per_sample;
+    uint32_t bytes_per_sample = bits_per_sample / 8;
+    uint32_t frame_bytes = bytes_per_sample * num_channels;
+    if (frame_bytes == 0) return WAV_ERROR_INVALID_FORMAT;
+
+    const uint32_t CHUNK_SAMPLES = 16384;
+    uint8_t* raw_buf = malloc(CHUNK_SAMPLES * frame_bytes);
+    if (!raw_buf) return WAV_ERROR_IO;
+
+    uint32_t sample = 0;
+    while (sample < num_samples) {
+        uint32_t to_read = (num_samples - sample < CHUNK_SAMPLES) ? (num_samples - sample) : CHUNK_SAMPLES;
+        size_t n_read = fread(raw_buf, frame_bytes, to_read, parser->fp);
+        if (n_read < to_read) {
+            free(raw_buf);
+            return WAV_ERROR_IO;
+        }
+
+        if (bits_per_sample == 16) {
+            const int16_t* src16 = (const int16_t*)raw_buf;
+            if (num_channels == 2) {
+                int32_t* dst0 = &wavfile->data[0][sample];
+                int32_t* dst1 = &wavfile->data[1][sample];
+                for (uint32_t s = 0; s < to_read; s++) {
+                    dst0[s] = (int32_t)src16[2 * s] << 16;
+                    dst1[s] = (int32_t)src16[2 * s + 1] << 16;
+                }
+            } else {
+                for (uint32_t s = 0; s < to_read; s++) {
+                    for (uint32_t ch = 0; ch < num_channels; ch++) {
+                        wavfile->data[ch][sample + s] = (int32_t)src16[s * num_channels + ch] << 16;
+                    }
+                }
+            }
+        } else if (bits_per_sample == 24) {
+            const uint8_t* src24 = raw_buf;
+            for (uint32_t s = 0; s < to_read; s++) {
+                for (uint32_t ch = 0; ch < num_channels; ch++) {
+                    uint32_t b0 = *src24++;
+                    uint32_t b1 = *src24++;
+                    uint32_t b2 = *src24++;
+                    wavfile->data[ch][sample + s] = (int32_t)((b2 << 24) | (b1 << 16) | (b0 << 8));
+                }
+            }
+        } else if (bits_per_sample == 32) {
+            const int32_t* src32 = (const int32_t*)raw_buf;
+            for (uint32_t s = 0; s < to_read; s++) {
+                for (uint32_t ch = 0; ch < num_channels; ch++) {
+                    wavfile->data[ch][sample + s] = src32[s * num_channels + ch];
+                }
+            }
+        } else if (bits_per_sample == 8) {
+            const uint8_t* src8 = raw_buf;
+            for (uint32_t s = 0; s < to_read; s++) {
+                for (uint32_t ch = 0; ch < num_channels; ch++) {
+                    wavfile->data[ch][sample + s] = ((int32_t)*src8++ - 128) << 24;
+                }
+            }
+        } else {
+            free(raw_buf);
+            return WAV_ERROR_INVALID_FORMAT;
+        }
+
+        sample += to_read;
     }
 
-    uint32_t bytes_per_sample = wavfile->format.bits_per_sample / 8;
-    for (uint32_t sample = 0; sample < wavfile->format.num_samples; sample++) {
-        for (uint32_t ch = 0; ch < wavfile->format.num_channels; ch++) {
-            uint64_t bitsbuf;
-            if (WAVParser_GetLittleEndianBytes(parser, bytes_per_sample, &bitsbuf) != WAV_ERROR_OK) return WAV_ERROR_IO;
-            wavfile->data[ch][sample] = conv_func((int32_t)bitsbuf);
+    free(raw_buf);
+    return WAV_ERROR_OK;
+}
+
+WAVApiResult WAV_GetWAVFormatFromFP(FILE* fp, struct WAVFileFormat* format) {
+    if (!fp || !format) return WAV_APIRESULT_INVALID_PARAMETER;
+
+    uint8_t riff_hdr[12];
+    if (fread(riff_hdr, 1, 12, fp) < 12) return WAV_APIRESULT_INVALID_FORMAT;
+    if (memcmp(riff_hdr, "RIFF", 4) != 0 || memcmp(riff_hdr + 8, "WAVE", 4) != 0) {
+        return WAV_APIRESULT_INVALID_FORMAT;
+    }
+
+    struct WAVFileFormat tmp = {0};
+    tmp.data_format = WAV_DATA_FORMAT_PCM;
+    bool found_fmt = false;
+
+    while (1) {
+        uint8_t chunk_hdr[8];
+        if (fread(chunk_hdr, 1, 8, fp) < 8) return WAV_APIRESULT_INVALID_FORMAT;
+
+        uint32_t chunk_size = (uint32_t)chunk_hdr[4] |
+                              ((uint32_t)chunk_hdr[5] << 8) |
+                              ((uint32_t)chunk_hdr[6] << 16) |
+                              ((uint32_t)chunk_hdr[7] << 24);
+
+        if (memcmp(chunk_hdr, "fmt ", 4) == 0) {
+            if (chunk_size < 16) return WAV_APIRESULT_INVALID_FORMAT;
+            uint8_t fmt_buf[16];
+            if (fread(fmt_buf, 1, 16, fp) < 16) return WAV_APIRESULT_INVALID_FORMAT;
+
+            uint16_t fmt_id = (uint16_t)fmt_buf[0] | ((uint16_t)fmt_buf[1] << 8);
+            if (fmt_id != 1 && fmt_id != 0xFFFE) return WAV_APIRESULT_INVALID_FORMAT;
+
+            tmp.num_channels    = (uint32_t)fmt_buf[2] | ((uint32_t)fmt_buf[3] << 8);
+            tmp.sampling_rate   = (uint32_t)fmt_buf[4] | ((uint32_t)fmt_buf[5] << 8) |
+                                  ((uint32_t)fmt_buf[6] << 16) | ((uint32_t)fmt_buf[7] << 24);
+            tmp.bits_per_sample = (uint32_t)fmt_buf[14] | ((uint32_t)fmt_buf[15] << 8);
+            found_fmt = true;
+
+            uint32_t remaining = chunk_size - 16;
+            if (chunk_size & 1) remaining++;
+            while (remaining > 0) {
+                uint8_t skip[256];
+                uint32_t n = (remaining < sizeof(skip)) ? remaining : sizeof(skip);
+                if (fread(skip, 1, n, fp) < n) return WAV_APIRESULT_IOERROR;
+                remaining -= n;
+            }
+        } else if (memcmp(chunk_hdr, "data", 4) == 0) {
+            if (!found_fmt) return WAV_APIRESULT_INVALID_FORMAT;
+            uint32_t frame_bytes = (tmp.bits_per_sample / 8) * tmp.num_channels;
+            if (frame_bytes == 0) return WAV_APIRESULT_INVALID_FORMAT;
+            tmp.num_samples = chunk_size / frame_bytes;
+            *format = tmp;
+            return WAV_APIRESULT_OK;
+        } else {
+            uint32_t remaining = (chunk_size + 1) & ~1U;
+            while (remaining > 0) {
+                uint8_t skip[256];
+                uint32_t n = (remaining < sizeof(skip)) ? remaining : sizeof(skip);
+                if (fread(skip, 1, n, fp) < n) return WAV_APIRESULT_IOERROR;
+                remaining -= n;
+            }
         }
     }
-    return WAV_ERROR_OK;
 }
 
 WAVApiResult WAV_GetWAVFormatFromFile(const char* filename, struct WAVFileFormat* format) {
     if (!filename || !format) return WAV_APIRESULT_NG;
     FILE* fp = fopen(filename, "rb");
     if (!fp) return WAV_APIRESULT_NG;
-
-    struct WAVParser parser;
-    WAVParser_Initialize(&parser, fp);
-    WAVApiResult res = (WAVParser_GetWAVFormat(&parser, format) == WAV_ERROR_OK) ? WAV_APIRESULT_OK : WAV_APIRESULT_NG;
-    WAVParser_Finalize(&parser);
+    WAVApiResult res = WAV_GetWAVFormatFromFP(fp, format);
     fclose(fp);
     return res;
 }
@@ -214,6 +322,7 @@ struct WAVFile* WAV_CreateFromFile(const char* filename) {
     if (!filename) return NULL;
     FILE* fp = fopen(filename, "rb");
     if (!fp) return NULL;
+    setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 
     struct WAVParser parser;
     WAVParser_Initialize(&parser, fp);
@@ -348,23 +457,79 @@ static WAVError WAVWriter_PutWAVHeader(struct WAVWriter* writer, const struct WA
 }
 
 static WAVError WAVWriter_PutWAVPcmData(struct WAVWriter* writer, const struct WAVFile* wavfile) {
-    int32_t (*conv_func)(int32_t) = NULL;
-    switch (wavfile->format.bits_per_sample) {
-        case 8:  conv_func = WAV_Convert32bitPCMto8bitPCM; break;
-        case 16: conv_func = WAV_Convert32bitPCMto16bitPCM; break;
-        case 24: conv_func = WAV_Convert32bitPCMto24bitPCM; break;
-        case 32: conv_func = WAV_Convert32bitPCMto32bitPCM; break;
-        default: return WAV_ERROR_INVALID_FORMAT;
+    if (!writer || !wavfile) return WAV_ERROR_INVALID_PARAMETER;
+
+    WAVWriter_Flush(writer);
+
+    uint32_t num_channels = wavfile->format.num_channels;
+    uint32_t num_samples = wavfile->format.num_samples;
+    uint32_t bits_per_sample = wavfile->format.bits_per_sample;
+    uint32_t bytes_per_sample = bits_per_sample / 8;
+    uint32_t frame_bytes = bytes_per_sample * num_channels;
+    if (frame_bytes == 0) return WAV_ERROR_INVALID_FORMAT;
+
+    const uint32_t CHUNK_SAMPLES = 16384;
+    uint8_t* raw_buf = malloc(CHUNK_SAMPLES * frame_bytes);
+    if (!raw_buf) return WAV_ERROR_IO;
+
+    uint32_t sample = 0;
+    while (sample < num_samples) {
+        uint32_t to_write = (num_samples - sample < CHUNK_SAMPLES) ? (num_samples - sample) : CHUNK_SAMPLES;
+
+        if (bits_per_sample == 16) {
+            int16_t* dst16 = (int16_t*)raw_buf;
+            if (num_channels == 2) {
+                const int32_t* src0 = &wavfile->data[0][sample];
+                const int32_t* src1 = &wavfile->data[1][sample];
+                for (uint32_t s = 0; s < to_write; s++) {
+                    dst16[2 * s]     = (int16_t)(src0[s] >> 16);
+                    dst16[2 * s + 1] = (int16_t)(src1[s] >> 16);
+                }
+            } else {
+                for (uint32_t s = 0; s < to_write; s++) {
+                    for (uint32_t ch = 0; ch < num_channels; ch++) {
+                        dst16[s * num_channels + ch] = (int16_t)(wavfile->data[ch][sample + s] >> 16);
+                    }
+                }
+            }
+        } else if (bits_per_sample == 24) {
+            uint8_t* dst24 = raw_buf;
+            for (uint32_t s = 0; s < to_write; s++) {
+                for (uint32_t ch = 0; ch < num_channels; ch++) {
+                    int32_t val = wavfile->data[ch][sample + s] >> 8;
+                    *dst24++ = (uint8_t)(val & 0xFF);
+                    *dst24++ = (uint8_t)((val >> 8) & 0xFF);
+                    *dst24++ = (uint8_t)((val >> 16) & 0xFF);
+                }
+            }
+        } else if (bits_per_sample == 32) {
+            int32_t* dst32 = (int32_t*)raw_buf;
+            for (uint32_t s = 0; s < to_write; s++) {
+                for (uint32_t ch = 0; ch < num_channels; ch++) {
+                    dst32[s * num_channels + ch] = wavfile->data[ch][sample + s];
+                }
+            }
+        } else if (bits_per_sample == 8) {
+            uint8_t* dst8 = raw_buf;
+            for (uint32_t s = 0; s < to_write; s++) {
+                for (uint32_t ch = 0; ch < num_channels; ch++) {
+                    *dst8++ = (uint8_t)((wavfile->data[ch][sample + s] >> 24) + 128);
+                }
+            }
+        } else {
+            free(raw_buf);
+            return WAV_ERROR_INVALID_FORMAT;
+        }
+
+        if (fwrite(raw_buf, frame_bytes, to_write, writer->fp) < to_write) {
+            free(raw_buf);
+            return WAV_ERROR_IO;
+        }
+
+        sample += to_write;
     }
 
-    uint32_t bytes_per_sample = wavfile->format.bits_per_sample / 8;
-    for (uint32_t sample = 0; sample < wavfile->format.num_samples; sample++) {
-        for (uint32_t ch = 0; ch < wavfile->format.num_channels; ch++) {
-            if (WAVWriter_PutLittleEndianBytes(writer, bytes_per_sample, (uint64_t)conv_func(WAVFile_PCM(wavfile, sample, ch))) != WAV_ERROR_OK) {
-                return WAV_ERROR_IO;
-            }
-        }
-    }
+    free(raw_buf);
     return WAV_ERROR_OK;
 }
 
@@ -372,6 +537,7 @@ WAVApiResult WAV_WriteToFile(const char* filename, const struct WAVFile* wavfile
     if (!filename || !wavfile) return WAV_APIRESULT_INVALID_PARAMETER;
     FILE* fp = fopen(filename, "wb");
     if (!fp) return WAV_APIRESULT_NG;
+    setvbuf(fp, NULL, _IOFBF, 256 * 1024);
 
     struct WAVWriter writer;
     WAVWriter_Initialize(&writer, fp);
@@ -381,4 +547,13 @@ WAVApiResult WAV_WriteToFile(const char* filename, const struct WAVFile* wavfile
     WAVWriter_Finalize(&writer);
     fclose(fp);
     return WAV_APIRESULT_OK;
+}
+
+WAVApiResult WAV_WriteWAVHeaderToFP(FILE* fp, const struct WAVFileFormat* format) {
+    if (!fp || !format) return WAV_APIRESULT_INVALID_PARAMETER;
+    struct WAVWriter writer;
+    WAVWriter_Initialize(&writer, fp);
+    WAVError err = WAVWriter_PutWAVHeader(&writer, format);
+    WAVWriter_Finalize(&writer);
+    return (err == WAV_ERROR_OK) ? WAV_APIRESULT_OK : WAV_APIRESULT_NG;
 }
