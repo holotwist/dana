@@ -156,6 +156,7 @@ static void* stream_encode_worker(void* arg) {
 
 static int do_encode(const char* in_filename, const char* out_filename, uint32_t encode_preset_no, uint8_t verpose_flag, int hybrid_shift, uint8_t enable_seek_table) {
     (void)hybrid_shift;
+    (void)enable_seek_table;
     bool is_in_pipe = (strcmp(in_filename, "-") == 0);
     bool is_out_pipe = (strcmp(out_filename, "-") == 0);
 

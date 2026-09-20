@@ -133,7 +133,9 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
     echo "==> Uninstalling installed files..."
     for m in "${MANIFESTS[@]}"; do
         if [ -f "$m" ]; then
-            while IFS= read -r file; do
+            while IFS= read -r file || [ -n "$file" ]; do
+                file=$(echo "$file" | tr -d '\r')
+                [ -z "$file" ] && continue
                 if [ -f "$file" ] || [ -L "$file" ]; then
                     echo "Removing $file"
                     if [ -w "$file" ]; then
