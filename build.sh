@@ -131,6 +131,7 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
     fi
 
     echo "==> Uninstalling installed files..."
+    MIME_DIR="${INSTALL_PREFIX:-/usr/local}/share/mime"
     for m in "${MANIFESTS[@]}"; do
         if [ -f "$m" ]; then
             while IFS= read -r file || [ -n "$file" ]; do
@@ -148,6 +149,16 @@ if [ "$DO_UNINSTALL" -eq 1 ]; then
             rm -f "$m"
         fi
     done
+
+    if command -v update-mime-database >/dev/null 2>&1 && [ -d "$MIME_DIR" ]; then
+        echo "==> Updating MIME database at $MIME_DIR..."
+        if [ -w "$MIME_DIR" ]; then
+            update-mime-database "$MIME_DIR"
+        else
+            sudo update-mime-database "$MIME_DIR"
+        fi
+    fi
+
     echo "==> Uninstallation complete."
     exit 0
 fi
@@ -226,11 +237,20 @@ if [ "$DO_INSTALL" -eq 1 ]; then
     fi
 
     TARGET_DIR="${INSTALL_PREFIX:-/usr/local}/bin"
+    MIME_DIR="${INSTALL_PREFIX:-/usr/local}/share/mime"
     if [ ! -w "$TARGET_DIR" ] && [ "$EUID" -ne 0 ]; then
         echo "Need sudo permissions to install into $TARGET_DIR:"
         sudo "${INSTALL_CMD[@]}"
+        if command -v update-mime-database >/dev/null 2>&1 && [ -d "$MIME_DIR" ]; then
+            echo "==> Updating MIME database at $MIME_DIR..."
+            sudo update-mime-database "$MIME_DIR"
+        fi
     else
         "${INSTALL_CMD[@]}"
+        if command -v update-mime-database >/dev/null 2>&1 && [ -d "$MIME_DIR" ]; then
+            echo "==> Updating MIME database at $MIME_DIR..."
+            update-mime-database "$MIME_DIR"
+        fi
     fi
     echo "==> Installation complete."
 fi
@@ -284,6 +304,10 @@ if [ "$PACKAGE" -eq 1 ]; then
     for doc in README.md LICENSE LICENSE.txt NOTICE.txt; do
         [ -f "$doc" ] && cp "$doc" "${PKG_STAGE}/"
     done
+
+    if [ -d "data" ]; then
+        cp -r "data" "${PKG_STAGE}/"
+    fi
 
     PKG_TAR="${PKG_NAME}.tar.gz"
     tar -czf "${DIST_DIR}/${PKG_TAR}" -C "$DIST_DIR" "$PKG_NAME"
