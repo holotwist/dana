@@ -4,6 +4,7 @@ project(dana VERSION 1.0.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 
 include(CheckCCompilerFlag)
+include(GNUInstallDirs)
 
 # This is for all architectures
 option(PORTABLE_BUILD "Disable native architecture optimizations" OFF)
@@ -83,4 +84,9 @@ install(TARGETS danaplay
 install(TARGETS danaplayd
     RUNTIME DESTINATION bin
     COMPONENT extras
+)
+
+install(FILES data/mime/dana.xml
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages
+    COMPONENT essential
 )

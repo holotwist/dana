@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="audio/x-dana">
+    <comment>Dana Audio</comment>
+    <alias type="audio/vnd.dana"/>
+    <glob pattern="*.dana"/>
+    <magic priority="50">
+      <match type="string" value="DA\xFF\x00" offset="0"/>
+    </magic>
+  </mime-type>
+
+  <mime-type type="audio/x-dana-hybrid">
+    <comment>DANA Hybrid Audio (Lossy)</comment>
+    <alias type="audio/vnd.dana.hybrid"/>
+    <glob pattern="*.dahl"/>
+    <magic priority="50">
+      <match type="string" value="DA\xFF\x00" offset="0"/>
+    </magic>
+  </mime-type>
+
+  <mime-type type="application/x-dana-correction">
+    <comment>DANA Hybrid Correction Stream</comment>
+    <alias type="application/vnd.dana.correction"/>
+    <glob pattern="*.dahc"/>
+    <magic priority="50">
+      <match type="string" value="DA\xFF\x00" offset="0"/>
+    </magic>
+  </mime-type>
+</mime-info>
