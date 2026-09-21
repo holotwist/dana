@@ -5,6 +5,7 @@
 #include "DANADecoder.h"
 #include "DANAInternal.h"
 #include "DANAByteArray.h"
+#include "DANAUtility.h"
 #include "wav.h"
 #include "command_line_parser.h"
 
@@ -33,6 +34,7 @@ static struct CommandLineParserSpecification command_line_spec[] = {
     { 'h', "help", COMMAND_LINE_PARSER_FALSE, "Show command help message", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'v', "version", COMMAND_LINE_PARSER_FALSE, "Show version information", NULL, COMMAND_LINE_PARSER_FALSE },
     { 's', "streaming", COMMAND_LINE_PARSER_FALSE, "Use streaming decode(for debug; 120fps)", NULL, COMMAND_LINE_PARSER_FALSE },
+    { 0, "legacy-wav", COMMAND_LINE_PARSER_FALSE, "Include RIFF LIST-INFO along with id3 when decoding to WAV", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "title", COMMAND_LINE_PARSER_TRUE, "Set Title", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "artist", COMMAND_LINE_PARSER_TRUE, "Set Artist", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "album", COMMAND_LINE_PARSER_TRUE, "Set Album", NULL, COMMAND_LINE_PARSER_FALSE },
@@ -204,16 +206,25 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
     header.encode_param = enc_param;
     header.num_samples  = wav_fmt.num_samples;
 
-    // CLI Metadata tags
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "title"))  header.metadata.title  = (char*)CommandLineParser_GetArgumentString(command_line_spec, "title");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "artist")) header.metadata.artist = (char*)CommandLineParser_GetArgumentString(command_line_spec, "artist");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "album"))  header.metadata.album  = (char*)CommandLineParser_GetArgumentString(command_line_spec, "album");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "year"))   header.metadata.year   = (char*)CommandLineParser_GetArgumentString(command_line_spec, "year");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "genre"))  header.metadata.genre  = (char*)CommandLineParser_GetArgumentString(command_line_spec, "genre");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "track"))  header.metadata.track  = (char*)CommandLineParser_GetArgumentString(command_line_spec, "track");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "bpm"))    header.metadata.bpm    = (char*)CommandLineParser_GetArgumentString(command_line_spec, "bpm");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "key"))    header.metadata.key    = (char*)CommandLineParser_GetArgumentString(command_line_spec, "key");
-    if (CommandLineParser_GetOptionAcquired(command_line_spec, "lyrics")) header.metadata.lyrics = (char*)CommandLineParser_GetArgumentString(command_line_spec, "lyrics");
+    DANAMetadata_Copy(&header.metadata, &wav_fmt.metadata);
+    DANAMetadata_Release(&wav_fmt.metadata);
+
+    // CLI overrides take top priority
+#define OVERRIDE_CLI_TAG(opt, field) \
+    if (CommandLineParser_GetOptionAcquired(command_line_spec, opt)) { \
+        if (header.metadata.field) free(header.metadata.field); \
+        header.metadata.field = DANAUtility_StrDup(CommandLineParser_GetArgumentString(command_line_spec, opt)); \
+    }
+    OVERRIDE_CLI_TAG("title",  title);
+    OVERRIDE_CLI_TAG("artist", artist);
+    OVERRIDE_CLI_TAG("album",  album);
+    OVERRIDE_CLI_TAG("year",   year);
+    OVERRIDE_CLI_TAG("genre",  genre);
+    OVERRIDE_CLI_TAG("track",  track);
+    OVERRIDE_CLI_TAG("bpm",    bpm);
+    OVERRIDE_CLI_TAG("key",    key);
+    OVERRIDE_CLI_TAG("lyrics", lyrics);
+#undef OVERRIDE_CLI_TAG
 
     if (CommandLineParser_GetOptionAcquired(command_line_spec, "cover")) {
         const char* cover_path = CommandLineParser_GetArgumentString(command_line_spec, "cover");
@@ -225,6 +236,7 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
             if (file_size > 20 * 1024 * 1024) {
                 fprintf(stderr, "Warning: Cover image %s is too large (%.2f MB). Max is 20 MB. Skipping.\n", cover_path, (double)file_size / (1024 * 1024));
             } else if (file_size > 0) {
+                if (header.metadata.cover_data) free(header.metadata.cover_data);
                 header.metadata.cover_size = (uint32_t)file_size;
                 header.metadata.cover_data = malloc(header.metadata.cover_size);
                 if (header.metadata.cover_data) {
@@ -261,8 +273,9 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
     if (DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &header_size) != DANA_APIRESULT_OK) {
         fprintf(stderr, "Error: Failed to encode header (metadata or cover too large)\n");
         free(header_buf);
-        if (sktb_buf) { free(sktb_buf); free(seek_samples); free(seek_offsets); }
-        if (header.metadata.cover_data) free(header.metadata.cover_data);
+        if (seek_samples) free(seek_samples);
+        if (seek_offsets) free(seek_offsets);
+        DANAMetadata_Release(&header.metadata);
         if (!is_in_pipe) fclose(in_fp);
         if (!is_out_pipe) fclose(out_fp);
         return 1;
@@ -462,15 +475,12 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
         fwrite(header_buf, 1, header_size, out_fp);
     }
 
-    if (sktb_buf) {
-        free(sktb_buf);
-        free(seek_samples);
-        free(seek_offsets);
-    }
+    if (seek_samples) free(seek_samples);
+    if (seek_offsets) free(seek_offsets);
+    header.metadata.seek_table = NULL;
+    if (sktb_buf) free(sktb_buf);
 
-    if (header.metadata.cover_data) {
-        free(header.metadata.cover_data);
-    }
+    DANAMetadata_Release(&header.metadata);
 
     if (verpose_flag) {
         fprintf(stderr, "Encode success! size: -> %u bytes\n", header_size + audio_bytes_written);
@@ -566,7 +576,7 @@ static void* stream_decode_worker(void* arg) {
     return NULL;
 }
 
-static int do_decode(const char* in_filename, const char* out_filename, uint8_t enable_crc_check, uint8_t verpose_flag) {
+static int do_decode(const char* in_filename, const char* out_filename, uint8_t enable_crc_check, uint8_t verpose_flag, bool legacy_info) {
     bool is_in_pipe = (strcmp(in_filename, "-") == 0);
     bool is_out_pipe = (strcmp(out_filename, "-") == 0);
 
@@ -768,11 +778,26 @@ static int do_decode(const char* in_filename, const char* out_filename, uint8_t 
         pthread_join(worker_threads[i], NULL);
     }
 
-    // Finalize WAV header sample count on seekable files
+    WAV_WriteMetadataToFP(out_fp, &header.metadata, legacy_info);
+
     if (!is_out_pipe) {
         wav_fmt.num_samples = total_samples_decoded;
+        long total_file_size = ftell(out_fp);
         fseek(out_fp, 0, SEEK_SET);
         WAV_WriteWAVHeaderToFP(out_fp, &wav_fmt);
+
+        // Update RIFF total size to include metadata chunks
+        if (total_file_size >= 8) {
+            uint32_t riff_payload_size = (uint32_t)(total_file_size - 8);
+            uint8_t sz[4] = {
+                (uint8_t)(riff_payload_size & 0xFF),
+                (uint8_t)((riff_payload_size >> 8) & 0xFF),
+                (uint8_t)((riff_payload_size >> 16) & 0xFF),
+                (uint8_t)((riff_payload_size >> 24) & 0xFF)
+            };
+            fseek(out_fp, 4, SEEK_SET);
+            fwrite(sz, 1, 4, out_fp);
+        }
     }
 
     free(raw_io_buf);
@@ -965,7 +990,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else {
-            if (do_decode(input_file, output_file, enable_crc_check, verbose_flag) != 0) {
+            bool legacy_info = CommandLineParser_GetOptionAcquired(command_line_spec, "legacy-wav");
+            if (do_decode(input_file, output_file, enable_crc_check, verbose_flag, legacy_info) != 0) {
                 fprintf(stderr, "%s: failed to decode %s.\n", argv[0], input_file);
                 return 1;
             }

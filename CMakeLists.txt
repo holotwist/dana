@@ -37,6 +37,7 @@ add_library(dana_core STATIC
     src/DANAUtility.c
     src/DANAEncoder.c
     src/command_line_parser.c
+    src/riff_meta.c
     src/wav.c
 )
 
