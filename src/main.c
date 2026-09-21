@@ -4,6 +4,8 @@
 #include "DANAEncoder.h"
 #include "DANADecoder.h"
 #include "DANAInternal.h"
+#include "DANAByteArray.h"
+#include "DANAUtility.h"
 #include "wav.h"
 #include "command_line_parser.h"
 
@@ -32,6 +34,7 @@ static struct CommandLineParserSpecification command_line_spec[] = {
     { 'h', "help", COMMAND_LINE_PARSER_FALSE, "Show command help message", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'v', "version", COMMAND_LINE_PARSER_FALSE, "Show version information", NULL, COMMAND_LINE_PARSER_FALSE },
     { 's', "streaming", COMMAND_LINE_PARSER_FALSE, "Use streaming decode(for debug; 120fps)", NULL, COMMAND_LINE_PARSER_FALSE },
+    { 0, "legacy-wav", COMMAND_LINE_PARSER_FALSE, "Include RIFF LIST-INFO along with id3 when decoding to WAV", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "title", COMMAND_LINE_PARSER_TRUE, "Set Title", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "artist", COMMAND_LINE_PARSER_TRUE, "Set Artist", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "album", COMMAND_LINE_PARSER_TRUE, "Set Album", NULL, COMMAND_LINE_PARSER_FALSE },
@@ -84,6 +87,14 @@ typedef struct {
     atomic_int error_code;
     uint32_t queued_count;
 } StreamPipeContext;
+
+static inline void put_fixed_varint(uint8_t** p, uint32_t val) {
+    **p = (val & 0x7F) | 0x80; *p += 1; val >>= 7;
+    **p = (val & 0x7F) | 0x80; *p += 1; val >>= 7;
+    **p = (val & 0x7F) | 0x80; *p += 1; val >>= 7;
+    **p = (val & 0x7F) | 0x80; *p += 1; val >>= 7;
+    **p = (val & 0x7F);        *p += 1;
+}
 
 static void* stream_encode_worker(void* arg) {
     StreamPipeContext* ctx = (StreamPipeContext*)arg;
@@ -156,6 +167,7 @@ static void* stream_encode_worker(void* arg) {
 
 static int do_encode(const char* in_filename, const char* out_filename, uint32_t encode_preset_no, uint8_t verpose_flag, int hybrid_shift, uint8_t enable_seek_table) {
     (void)hybrid_shift;
+    (void)enable_seek_table;
     bool is_in_pipe = (strcmp(in_filename, "-") == 0);
     bool is_out_pipe = (strcmp(out_filename, "-") == 0);
 
@@ -194,10 +206,80 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
     header.encode_param = enc_param;
     header.num_samples  = wav_fmt.num_samples;
 
-    uint32_t header_buf_size = 1024 * 1024;
+    DANAMetadata_Copy(&header.metadata, &wav_fmt.metadata);
+    DANAMetadata_Release(&wav_fmt.metadata);
+
+    // CLI overrides take top priority
+#define OVERRIDE_CLI_TAG(opt, field) \
+    if (CommandLineParser_GetOptionAcquired(command_line_spec, opt)) { \
+        if (header.metadata.field) free(header.metadata.field); \
+        header.metadata.field = DANAUtility_StrDup(CommandLineParser_GetArgumentString(command_line_spec, opt)); \
+    }
+    OVERRIDE_CLI_TAG("title",  title);
+    OVERRIDE_CLI_TAG("artist", artist);
+    OVERRIDE_CLI_TAG("album",  album);
+    OVERRIDE_CLI_TAG("year",   year);
+    OVERRIDE_CLI_TAG("genre",  genre);
+    OVERRIDE_CLI_TAG("track",  track);
+    OVERRIDE_CLI_TAG("bpm",    bpm);
+    OVERRIDE_CLI_TAG("key",    key);
+    OVERRIDE_CLI_TAG("lyrics", lyrics);
+#undef OVERRIDE_CLI_TAG
+
+    if (CommandLineParser_GetOptionAcquired(command_line_spec, "cover")) {
+        const char* cover_path = CommandLineParser_GetArgumentString(command_line_spec, "cover");
+        FILE* f = fopen(cover_path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long file_size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (file_size > 20 * 1024 * 1024) {
+                fprintf(stderr, "Warning: Cover image %s is too large (%.2f MB). Max is 20 MB. Skipping.\n", cover_path, (double)file_size / (1024 * 1024));
+            } else if (file_size > 0) {
+                if (header.metadata.cover_data) free(header.metadata.cover_data);
+                header.metadata.cover_size = (uint32_t)file_size;
+                header.metadata.cover_data = malloc(header.metadata.cover_size);
+                if (header.metadata.cover_data) {
+                    fread(header.metadata.cover_data, 1, header.metadata.cover_size, f);
+                }
+            }
+            fclose(f);
+        } else {
+            fprintf(stderr, "Warning: Could not open cover image %s\n", cover_path);
+        }
+    }
+
+    // Pre-reserve exact seek table size for disk files
+    uint32_t num_seek_points = 0;
+    uint32_t sktb_size = 0;
+    uint8_t* sktb_buf = NULL;
+    uint32_t* seek_samples = NULL;
+    uint32_t* seek_offsets = NULL;
+
+    if (!is_out_pipe && enable_seek_table && wav_fmt.num_samples != DANA_NUM_SAMPLES_INVALID && wav_fmt.sampling_rate > 0) {
+        num_seek_points = (wav_fmt.num_samples / wav_fmt.sampling_rate) + 1;
+        sktb_size = 4 + (num_seek_points * 10);
+        sktb_buf = calloc(1, sktb_size);
+        seek_samples = malloc(sizeof(uint32_t) * (num_seek_points + 1));
+        seek_offsets = malloc(sizeof(uint32_t) * (num_seek_points + 1));
+
+        header.metadata.seek_table = sktb_buf;
+        header.metadata.seek_table_size = sktb_size;
+    }
+
+    uint32_t header_buf_size = DANA_HEADER_SIZE + sktb_size + header.metadata.cover_size + (64 * 1024);
     uint8_t* header_buf = malloc(header_buf_size);
     uint32_t header_size = 0;
-    DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &header_size);
+    if (DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &header_size) != DANA_APIRESULT_OK) {
+        fprintf(stderr, "Error: Failed to encode header (metadata or cover too large)\n");
+        free(header_buf);
+        if (seek_samples) free(seek_samples);
+        if (seek_offsets) free(seek_offsets);
+        DANAMetadata_Release(&header.metadata);
+        if (!is_in_pipe) fclose(in_fp);
+        if (!is_out_pipe) fclose(out_fp);
+        return 1;
+    }
     fwrite(header_buf, 1, header_size, out_fp);
 
     uint32_t chunk_samples = enc_param.max_num_block_samples;
@@ -242,6 +324,8 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
     uint32_t sample_pos = 0;
     uint32_t total_blocks = 0, max_block_size = 0, max_bps = 0;
     uint32_t audio_bytes_written = 0;
+    uint32_t current_seek_idx = 0;
+    uint32_t next_seek_sample = 0;
 
     bool reached_eof = false;
 
@@ -336,6 +420,16 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
         pthread_mutex_unlock(&ctx.mutex);
 
         StreamSlot* s = &ctx.slots[emit_idx];
+
+        if (sktb_buf && current_seek_idx < num_seek_points) {
+            if (s->start_sample >= next_seek_sample) {
+                seek_samples[current_seek_idx] = s->start_sample;
+                seek_offsets[current_seek_idx] = audio_bytes_written;
+                current_seek_idx++;
+                next_seek_sample += wave_fmt.sampling_rate;
+            }
+        }
+
         fwrite(s->compressed, 1, s->compressed_size, out_fp);
         audio_bytes_written += s->compressed_size;
         total_blocks        += s->num_blocks;
@@ -353,17 +447,40 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
         pthread_join(worker_threads[i], NULL);
     }
 
-    // Finalize header with counts on seekable streams
+    // Finalize header and populate seek table
     if (!is_out_pipe) {
         header.num_samples        = sample_pos;
         header.num_blocks         = total_blocks;
         header.max_block_size     = max_block_size;
         header.max_bit_per_second = max_bps;
 
+        if (sktb_buf) {
+            uint8_t* p = sktb_buf;
+            DANAByteArray_PutUint32(&p, current_seek_idx);
+            uint32_t prev_s = 0, prev_off = 0;
+            for (uint32_t i = 0; i < current_seek_idx; i++) {
+                put_fixed_varint(&p, seek_samples[i] - prev_s);
+                put_fixed_varint(&p, seek_offsets[i] - prev_off);
+                prev_s = seek_samples[i];
+                prev_off = seek_offsets[i];
+            }
+            while ((uint32_t)(p - sktb_buf) < sktb_size) {
+                *p++ = 0x80;
+            }
+        }
+
         fseek(out_fp, 0, SEEK_SET);
-        DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &header_size);
+        uint32_t final_header_size = 0;
+        DANAEncoder_EncodeHeader(&header, header_buf, header_buf_size, &final_header_size);
         fwrite(header_buf, 1, header_size, out_fp);
     }
+
+    if (seek_samples) free(seek_samples);
+    if (seek_offsets) free(seek_offsets);
+    header.metadata.seek_table = NULL;
+    if (sktb_buf) free(sktb_buf);
+
+    DANAMetadata_Release(&header.metadata);
 
     if (verpose_flag) {
         fprintf(stderr, "Encode success! size: -> %u bytes\n", header_size + audio_bytes_written);
@@ -459,7 +576,7 @@ static void* stream_decode_worker(void* arg) {
     return NULL;
 }
 
-static int do_decode(const char* in_filename, const char* out_filename, uint8_t enable_crc_check, uint8_t verpose_flag) {
+static int do_decode(const char* in_filename, const char* out_filename, uint8_t enable_crc_check, uint8_t verpose_flag, bool legacy_info) {
     bool is_in_pipe = (strcmp(in_filename, "-") == 0);
     bool is_out_pipe = (strcmp(out_filename, "-") == 0);
 
@@ -487,9 +604,16 @@ static int do_decode(const char* in_filename, const char* out_filename, uint8_t 
     free(full_hdr);
 
     if (verpose_flag) {
-        printf("Num Channels:                %u\n", header.wave_format.num_channels);
-        printf("Bit Per Sample:              %u\n", header.wave_format.bit_per_sample);
-        printf("Sampling Rate:               %u\n", header.wave_format.sampling_rate);
+        if (header.metadata.title)  fprintf(stderr, "Title:                       %s\n", header.metadata.title);
+        if (header.metadata.artist) fprintf(stderr, "Artist:                      %s\n", header.metadata.artist);
+        if (header.metadata.album)  fprintf(stderr, "Album:                       %s\n", header.metadata.album);
+        if (header.metadata.cover_data) fprintf(stderr, "Cover Art:                   Available (%u bytes)\n", header.metadata.cover_size);
+        fprintf(stderr, "Num Channels:                %u\n", header.wave_format.num_channels);
+        fprintf(stderr, "Bit Per Sample:              %u\n", header.wave_format.bit_per_sample);
+        fprintf(stderr, "Sampling Rate:               %u\n", header.wave_format.sampling_rate);
+        if (header.metadata.seek_table) {
+            fprintf(stderr, "Seek Table:                  Available (%u bytes)\n", header.metadata.seek_table_size);
+        }
     }
 
     FILE* out_fp = is_out_pipe ? stdout : fopen(out_filename, "wb");
@@ -654,11 +778,26 @@ static int do_decode(const char* in_filename, const char* out_filename, uint8_t 
         pthread_join(worker_threads[i], NULL);
     }
 
-    // Finalize WAV header sample count on seekable files
+    WAV_WriteMetadataToFP(out_fp, &header.metadata, legacy_info);
+
     if (!is_out_pipe) {
         wav_fmt.num_samples = total_samples_decoded;
+        long total_file_size = ftell(out_fp);
         fseek(out_fp, 0, SEEK_SET);
         WAV_WriteWAVHeaderToFP(out_fp, &wav_fmt);
+
+        // Update RIFF total size to include metadata chunks
+        if (total_file_size >= 8) {
+            uint32_t riff_payload_size = (uint32_t)(total_file_size - 8);
+            uint8_t sz[4] = {
+                (uint8_t)(riff_payload_size & 0xFF),
+                (uint8_t)((riff_payload_size >> 8) & 0xFF),
+                (uint8_t)((riff_payload_size >> 16) & 0xFF),
+                (uint8_t)((riff_payload_size >> 24) & 0xFF)
+            };
+            fseek(out_fp, 4, SEEK_SET);
+            fwrite(sz, 1, 4, out_fp);
+        }
     }
 
     free(raw_io_buf);
@@ -851,7 +990,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else {
-            if (do_decode(input_file, output_file, enable_crc_check, verbose_flag) != 0) {
+            bool legacy_info = CommandLineParser_GetOptionAcquired(command_line_spec, "legacy-wav");
+            if (do_decode(input_file, output_file, enable_crc_check, verbose_flag, legacy_info) != 0) {
                 fprintf(stderr, "%s: failed to decode %s.\n", argv[0], input_file);
                 return 1;
             }

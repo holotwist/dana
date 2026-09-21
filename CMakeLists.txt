@@ -37,6 +37,7 @@ add_library(dana_core STATIC
     src/DANAUtility.c
     src/DANAEncoder.c
     src/command_line_parser.c
+    src/riff_meta.c
     src/wav.c
 )
 
@@ -74,7 +75,12 @@ install(TARGETS dana
     COMPONENT essential
 )
 
-install(TARGETS danaplay danaplayd
+install(TARGETS danaplay
+    RUNTIME DESTINATION bin
+    COMPONENT extras
+)
+
+install(TARGETS danaplayd
     RUNTIME DESTINATION bin
     COMPONENT extras
 )

@@ -119,22 +119,35 @@ done
 
 # Handle uninstall
 if [ "$DO_UNINSTALL" -eq 1 ]; then
-    MANIFEST="${BUILD_DIR}/install_manifest.txt"
-    if [ ! -f "$MANIFEST" ]; then
-        echo "Error: install_manifest.txt not found in ${BUILD_DIR}. Cannot uninstall."
+    MANIFESTS=("${BUILD_DIR}"/install_manifest*.txt)
+    FOUND=0
+    for m in "${MANIFESTS[@]}"; do
+        [ -f "$m" ] && FOUND=1
+    done
+
+    if [ "$FOUND" -eq 0 ]; then
+        echo "Error: No install_manifest found in ${BUILD_DIR}. Cannot uninstall."
         exit 1
     fi
+
     echo "==> Uninstalling installed files..."
-    while IFS= read -r file; do
-        if [ -f "$file" ] || [ -L "$file" ]; then
-            echo "Removing $file"
-            if [ -w "$file" ]; then
-                rm -f "$file"
-            else
-                sudo rm -f "$file"
-            fi
+    for m in "${MANIFESTS[@]}"; do
+        if [ -f "$m" ]; then
+            while IFS= read -r file || [ -n "$file" ]; do
+                file=$(echo "$file" | tr -d '\r')
+                [ -z "$file" ] && continue
+                if [ -f "$file" ] || [ -L "$file" ]; then
+                    echo "Removing $file"
+                    if [ -w "$file" ]; then
+                        rm -f "$file"
+                    else
+                        sudo rm -f "$file"
+                    fi
+                fi
+            done < "$m"
+            rm -f "$m"
         fi
-    done < "$MANIFEST"
+    done
     echo "==> Uninstallation complete."
     exit 0
 fi

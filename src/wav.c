@@ -1,4 +1,5 @@
 #include "wav.h"
+#include "riff_meta.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,6 +159,45 @@ static WAVError WAVParser_GetWAVFormat(struct WAVParser* parser, struct WAVFileF
         } else if (strncmp(chunk_id, "data", 4) == 0) {
             if (!found_fmt) return WAV_ERROR_INVALID_FORMAT;
             tmp_format.num_samples = chunk_size / ((tmp_format.bits_per_sample / 8) * tmp_format.num_channels);
+            
+            long data_start_pos = ftell(parser->fp);
+            if (data_start_pos >= 0) {
+                long padded_data_size = (long)((chunk_size + 1) & ~1U);
+                if (fseek(parser->fp, data_start_pos + padded_data_size, SEEK_SET) == 0) {
+                    while (1) {
+                        uint8_t post_hdr[8];
+                        if (fread(post_hdr, 1, 8, parser->fp) < 8) break;
+                        uint32_t post_sz = (uint32_t)post_hdr[4] |
+                                           ((uint32_t)post_hdr[5] << 8) |
+                                           ((uint32_t)post_hdr[6] << 16) |
+                                           ((uint32_t)post_hdr[7] << 24);
+
+                        if (memcmp(post_hdr, "id3 ", 4) == 0 || memcmp(post_hdr, "ID3 ", 4) == 0) {
+                            uint8_t* id3_buf = malloc(post_sz);
+                            if (id3_buf) {
+                                if (fread(id3_buf, 1, post_sz, parser->fp) == post_sz) {
+                                    RIFFMeta_ParseId3Chunk(id3_buf, post_sz, &tmp_format.metadata);
+                                }
+                                free(id3_buf);
+                            }
+                            if (post_sz & 1) fgetc(parser->fp);
+                        } else if (memcmp(post_hdr, "LIST", 4) == 0 && post_sz >= 4) {
+                            uint8_t* list_buf = malloc(post_sz);
+                            if (list_buf) {
+                                if (fread(list_buf, 1, post_sz, parser->fp) == post_sz) {
+                                    RIFFMeta_ParseInfoChunk(list_buf, post_sz, &tmp_format.metadata);
+                                }
+                                free(list_buf);
+                            }
+                            if (post_sz & 1) fgetc(parser->fp);
+                        } else {
+                            long skip_sz = (long)((post_sz + 1) & ~1U);
+                            if (fseek(parser->fp, skip_sz, SEEK_CUR) != 0) break;
+                        }
+                    }
+                    fseek(parser->fp, data_start_pos, SEEK_SET);
+                }
+            }
             break;
         } else {
             if (WAVParser_Seek(parser, padded_size, SEEK_CUR) != WAV_ERROR_OK) return WAV_ERROR_IO;
@@ -290,11 +330,74 @@ WAVApiResult WAV_GetWAVFormatFromFP(FILE* fp, struct WAVFileFormat* format) {
                 if (fread(skip, 1, n, fp) < n) return WAV_APIRESULT_IOERROR;
                 remaining -= n;
             }
+        } else if (memcmp(chunk_hdr, "id3 ", 4) == 0 || memcmp(chunk_hdr, "ID3 ", 4) == 0) {
+            uint8_t* id3_buf = malloc(chunk_size);
+            if (id3_buf) {
+                if (fread(id3_buf, 1, chunk_size, fp) == chunk_size) {
+                    RIFFMeta_ParseId3Chunk(id3_buf, chunk_size, &tmp.metadata);
+                }
+                free(id3_buf);
+            }
+            if (chunk_size & 1) fgetc(fp);
+        } else if (memcmp(chunk_hdr, "LIST", 4) == 0 && chunk_size >= 4) {
+            uint8_t* list_buf = malloc(chunk_size);
+            if (list_buf) {
+                if (fread(list_buf, 1, chunk_size, fp) == chunk_size) {
+                    RIFFMeta_ParseInfoChunk(list_buf, chunk_size, &tmp.metadata);
+                }
+                free(list_buf);
+            }
+            if (chunk_size & 1) fgetc(fp);
         } else if (memcmp(chunk_hdr, "data", 4) == 0) {
             if (!found_fmt) return WAV_APIRESULT_INVALID_FORMAT;
             uint32_t frame_bytes = (tmp.bits_per_sample / 8) * tmp.num_channels;
             if (frame_bytes == 0) return WAV_APIRESULT_INVALID_FORMAT;
             tmp.num_samples = chunk_size / frame_bytes;
+
+            // Check if stream is seekable
+            long data_start_pos = ftell(fp);
+            if (data_start_pos >= 0) {
+                // Seek past PCM data chunk to scan trailing id3/LIST metadata
+                long padded_data_size = (long)((chunk_size + 1) & ~1U);
+                if (fseek(fp, data_start_pos + padded_data_size, SEEK_SET) == 0) {
+                    while (1) {
+                        uint8_t post_hdr[8];
+                        if (fread(post_hdr, 1, 8, fp) < 8) break;
+                        uint32_t post_sz = (uint32_t)post_hdr[4] |
+                                           ((uint32_t)post_hdr[5] << 8) |
+                                           ((uint32_t)post_hdr[6] << 16) |
+                                           ((uint32_t)post_hdr[7] << 24);
+
+                        if (memcmp(post_hdr, "id3 ", 4) == 0 || memcmp(post_hdr, "ID3 ", 4) == 0) {
+                            uint8_t* id3_buf = malloc(post_sz);
+                            if (id3_buf) {
+                                if (fread(id3_buf, 1, post_sz, fp) == post_sz) {
+                                    RIFFMeta_ParseId3Chunk(id3_buf, post_sz, &tmp.metadata);
+                                }
+                                free(id3_buf);
+                            }
+                            if (post_sz & 1) fgetc(fp);
+                        } else if (memcmp(post_hdr, "LIST", 4) == 0 && post_sz >= 4) {
+                            uint8_t* list_buf = malloc(post_sz);
+                            if (list_buf) {
+                                if (fread(list_buf, 1, post_sz, fp) == post_sz) {
+                                    RIFFMeta_ParseInfoChunk(list_buf, post_sz, &tmp.metadata);
+                                }
+                                free(list_buf);
+                            }
+                            if (post_sz & 1) fgetc(fp);
+                        } else {
+                            long skip_sz = (long)((post_sz + 1) & ~1U);
+                            if (fseek(fp, skip_sz, SEEK_CUR) != 0) break;
+                        }
+                    }
+                    // Restore file position to beginning of PCM data for decoding
+                    fseek(fp, data_start_pos, SEEK_SET);
+                } else {
+                    fseek(fp, data_start_pos, SEEK_SET);
+                }
+            }
+
             *format = tmp;
             return WAV_APIRESULT_OK;
         } else {
@@ -365,6 +468,7 @@ struct WAVFile* WAV_Create(const struct WAVFileFormat* format) {
 
 void WAV_Destroy(struct WAVFile* wavfile) {
     if (wavfile) {
+        DANAMetadata_Release(&wavfile->format.metadata);
         if (wavfile->data) {
             for (uint32_t ch = 0; ch < wavfile->format.num_channels; ch++) {
                 if (wavfile->data[ch]) free(wavfile->data[ch]);
@@ -556,4 +660,44 @@ WAVApiResult WAV_WriteWAVHeaderToFP(FILE* fp, const struct WAVFileFormat* format
     WAVError err = WAVWriter_PutWAVHeader(&writer, format);
     WAVWriter_Finalize(&writer);
     return (err == WAV_ERROR_OK) ? WAV_APIRESULT_OK : WAV_APIRESULT_NG;
+}
+
+WAVApiResult WAV_WriteMetadataToFP(FILE* fp, const struct DANAMetadata* meta, bool legacy_info) {
+    if (!fp || !meta) return WAV_APIRESULT_INVALID_PARAMETER;
+
+    if (legacy_info) {
+        uint32_t info_size = 0;
+        uint8_t* info_chunk = RIFFMeta_BuildInfoChunk(meta, &info_size);
+        if (info_chunk && info_size > 0) {
+            fwrite("LIST", 1, 4, fp);
+            uint8_t sz_buf[4] = {
+                (uint8_t)(info_size & 0xFF),
+                (uint8_t)((info_size >> 8) & 0xFF),
+                (uint8_t)((info_size >> 16) & 0xFF),
+                (uint8_t)((info_size >> 24) & 0xFF)
+            };
+            fwrite(sz_buf, 1, 4, fp);
+            fwrite(info_chunk, 1, info_size, fp);
+            if (info_size & 1) fputc(0, fp);
+            free(info_chunk);
+        }
+    }
+
+    uint32_t id3_size = 0;
+    uint8_t* id3_chunk = RIFFMeta_BuildId3Chunk(meta, &id3_size);
+    if (id3_chunk && id3_size > 0) {
+        fwrite("id3 ", 1, 4, fp);
+        uint8_t sz_buf[4] = {
+            (uint8_t)(id3_size & 0xFF),
+            (uint8_t)((id3_size >> 8) & 0xFF),
+            (uint8_t)((id3_size >> 16) & 0xFF),
+            (uint8_t)((id3_size >> 24) & 0xFF)
+        };
+        fwrite(sz_buf, 1, 4, fp);
+        fwrite(id3_chunk, 1, id3_size, fp);
+        if (id3_size & 1) fputc(0, fp);
+        free(id3_chunk);
+    }
+
+    return WAV_APIRESULT_OK;
 }

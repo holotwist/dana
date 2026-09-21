@@ -18,12 +18,15 @@ typedef enum {
     WAV_APIRESULT_INVALID_PARAMETER
 } WAVApiResult;
 
+#include "DANA.h"
+
 struct WAVFileFormat {
-    WAVDataFormat data_format;
-    uint32_t      num_channels;
-    uint32_t      sampling_rate;
-    uint32_t      bits_per_sample;
-    uint32_t      num_samples;
+    WAVDataFormat       data_format;
+    uint32_t            num_channels;
+    uint32_t            sampling_rate;
+    uint32_t            bits_per_sample;
+    uint32_t            num_samples;
+    struct DANAMetadata metadata;
 };
 
 struct WAVFile {
@@ -44,6 +47,7 @@ WAVApiResult WAV_WriteToFile(const char* filename, const struct WAVFile* wavfile
 WAVApiResult WAV_GetWAVFormatFromFile(const char* filename, struct WAVFileFormat* format);
 WAVApiResult WAV_GetWAVFormatFromFP(FILE* fp, struct WAVFileFormat* format);
 WAVApiResult WAV_WriteWAVHeaderToFP(FILE* fp, const struct WAVFileFormat* format);
+WAVApiResult WAV_WriteMetadataToFP(FILE* fp, const struct DANAMetadata* meta, bool legacy_info);
 
 #ifdef __cplusplus
 }
