@@ -7,7 +7,7 @@
 static uint32_t CommandLineParser_GetNumSpecifications(const struct CommandLineParserSpecification* clps) {
     assert(clps != NULL);
     uint32_t num_specs = 0;
-    while (clps->short_option != 0) {
+    while (clps->short_option != 0 || clps->long_option != NULL) {
         num_specs++;
         clps++;
     }
@@ -21,7 +21,9 @@ static CommandLineParserBool CommandLineParser_CheckSpecification(const struct C
     for (uint32_t i = 0; i < num_specs; i++) {
         for (uint32_t j = 0; j < num_specs; j++) {
             if (i == j) continue;
-            if (clps[j].short_option == clps[i].short_option) return COMMAND_LINE_PARSER_FALSE;
+            if (clps[j].short_option != 0 && clps[i].short_option != 0 && clps[j].short_option == clps[i].short_option) {
+                return COMMAND_LINE_PARSER_FALSE;
+            }
             if (clps[j].long_option && clps[i].long_option && strcmp(clps[j].long_option, clps[i].long_option) == 0) {
                 return COMMAND_LINE_PARSER_FALSE;
             }
@@ -46,12 +48,14 @@ void CommandLineParser_PrintDescription(const struct CommandLineParserSpecificat
         const char* arg_option_attr = (pspec->need_argument == COMMAND_LINE_PARSER_TRUE) ? "(needs argument)" : "";
         
         char command_str[256];
-        if (pspec->long_option != NULL) {
+        if (pspec->short_option != 0 && pspec->long_option != NULL) {
             snprintf(command_str, sizeof(command_str), "  -%c, --%s", pspec->short_option, pspec->long_option);
+        } else if (pspec->long_option != NULL) {
+            snprintf(command_str, sizeof(command_str), "      --%s", pspec->long_option);
         } else {
             snprintf(command_str, sizeof(command_str), "  -%c", pspec->short_option);
         }
-        printf("%-20s %-18s  %s \n", command_str, arg_option_attr, pspec->description ? pspec->description : "");
+        printf("%-26s %-18s  %s \n", command_str, arg_option_attr, pspec->description ? pspec->description : "");
     }
 }
 
@@ -61,7 +65,7 @@ static CommandLineParserResult CommandLineParser_GetSpecificationIndex(const str
     uint32_t num_specs = CommandLineParser_GetNumSpecifications(clps);
     if (strlen(option_name) == 1) {
         for (uint32_t i = 0; i < num_specs; i++) {
-            if (option_name[0] == clps[i].short_option) {
+            if (clps[i].short_option != 0 && option_name[0] == clps[i].short_option) {
                 *index = i;
                 return COMMAND_LINE_PARSER_RESULT_OK;
             }
@@ -156,7 +160,7 @@ CommandLineParserResult CommandLineParser_ParseArguments(
                 uint32_t spec_no;
                 for (spec_no = 0; spec_no < num_specs; spec_no++) {
                     struct CommandLineParserSpecification* pspec = &clps[spec_no];
-                    if (arg_str[str_index] == pspec->short_option) {
+                    if (pspec->short_option != 0 && arg_str[str_index] == pspec->short_option) {
                         if (pspec->acquired == COMMAND_LINE_PARSER_TRUE) {
                             fprintf(stderr, "%s: Option \'%c\' multiply specified. \n", argv[0], pspec->short_option);
                             return COMMAND_LINE_PARSER_RESULT_OPTION_MULTIPLY_SPECIFIED;
