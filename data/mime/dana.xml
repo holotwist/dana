@@ -10,7 +10,7 @@
   </mime-type>
 
   <mime-type type="audio/x-dana-hybrid">
-    <comment>DANA Hybrid Audio (Lossy)</comment>
+    <comment>Dana Hybrid Audio (Lossy)</comment>
     <alias type="audio/vnd.dana.hybrid"/>
     <glob pattern="*.dahl"/>
     <magic priority="50">
@@ -19,7 +19,7 @@
   </mime-type>
 
   <mime-type type="application/x-dana-correction">
-    <comment>DANA Hybrid Correction Stream</comment>
+    <comment>Dana Hybrid Correction Stream</comment>
     <alias type="application/vnd.dana.correction"/>
     <glob pattern="*.dahc"/>
     <magic priority="50">
