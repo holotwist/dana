@@ -307,8 +307,7 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
         num_threads = (uint32_t)atoi(CommandLineParser_GetArgumentString(command_line_spec, "threads"));
     }
     if (num_threads == 0) {
-        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+        num_threads = DANAUtility_GetPhysicalCoreCount();
     }
     if (num_threads > 64) num_threads = 64;
 
@@ -656,8 +655,7 @@ static int do_decode(const char* in_filename, const char* out_filename, uint8_t 
         num_threads = (uint32_t)atoi(CommandLineParser_GetArgumentString(command_line_spec, "threads"));
     }
     if (num_threads == 0) {
-        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+        num_threads = DANAUtility_GetPhysicalCoreCount();
     }
     if (num_threads > 64) num_threads = 64;
 

@@ -720,8 +720,7 @@ DANAApiResult DANADecoder_DecodeWhole(struct DANADecoder* restrict decoder, cons
 
     uint32_t num_threads = decoder->num_threads;
     if (num_threads == 0) {
-        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+        num_threads = DANAUtility_GetPhysicalCoreCount();
     }
     if (num_threads > num_blocks_found) num_threads = num_blocks_found;
     if (num_threads < 1) num_threads = 1;

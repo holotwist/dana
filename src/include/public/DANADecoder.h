@@ -16,7 +16,7 @@ struct DANADecoderConfig {
     uint32_t max_lms_order_per_filter;
     uint8_t  enable_crc_check;
     uint8_t  verpose_flag;
-    uint32_t num_threads; // 0: auto-detect all CPU cores
+    uint32_t num_threads; // 0: auto-detect physical cores
 };
 
 struct DANAStreamingDecoderConfig {
