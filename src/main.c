@@ -928,7 +928,7 @@ static void print_usage(char** argv) {
 }
 
 static void print_version_info(void) {
-    printf("DANA - Digital Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
+    printf("DANA - Dana Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
     printf("Copyright (c) 2026 holotwist. All rights reserved.\n");
 }
 
@@ -973,7 +973,7 @@ int main(int argc, char** argv) {
     else if (CommandLineParser_GetOptionAcquired(command_line_spec, "quiet")) verbose_flag = 0;
 
     if (verbose_flag) {
-        fprintf(stderr, "DANA - Digital Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
+        fprintf(stderr, "DANA - Dana Audio Non-lossy Archive, Version %s\n", DANA_VERSION_STRING);
         fprintf(stderr, "Copyright (c) 2026 holotwist. All rights reserved.\n\n");
     }
 
