@@ -3,7 +3,7 @@
 
 #include "DANA.h"
 
-#define DANA_DECODER_VERSION_STRING "1.0.0"
+#define DANA_DECODER_VERSION_STRING "1.0.1"
 
 struct DANADecoder;
 struct DANAStreamingDecoder;
