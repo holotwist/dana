@@ -3,8 +3,8 @@
 
 #include "DANAStdint.h"
 
-#define DANA_VERSION_STRING          "1.0.1"
-#define DANA_FORMAT_VERSION          1
+#define DANA_VERSION_STRING          "1.1.0"
+#define DANA_FORMAT_VERSION          2
 #define DANA_HEADER_SIZE             43
 #define DANA_BLOCK_HEADER_SIZE       9
 #define DANA_NUM_SAMPLES_INVALID     0xFFFFFFFF

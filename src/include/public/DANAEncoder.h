@@ -15,7 +15,8 @@ struct DANAEncoderConfig {
     uint32_t max_lms_order_per_filter;
     uint8_t  verpose_flag;
     uint8_t  enable_seek_table;
-    uint32_t num_threads; // 0: auto-detect physical cores
+    uint8_t  enable_dag;   // 1: enable dag
+    uint32_t num_threads;  // 0: auto-detect physical cores
 };
 
 #ifdef __cplusplus
@@ -31,6 +32,7 @@ DANAApiResult DANAEncoder_SetMetadata(struct DANAEncoder* encoder, const struct 
 
 DANAApiResult DANAEncoder_EncodeHeader(const struct DANAHeaderInfo* restrict header, uint8_t* restrict data, uint32_t data_size, uint32_t* restrict header_size_out);
 DANAApiResult DANAEncoder_EncodeBlock(struct DANAEncoder* restrict encoder, const int32_t* const* restrict input, uint32_t num_samples, uint8_t* restrict data, uint32_t data_size, uint32_t* restrict output_size);
+DANAApiResult DANAEncoder_EncodeChunk(struct DANAEncoder* restrict encoder, const int32_t* const* restrict input, uint32_t num_samples, uint8_t* restrict data, uint32_t data_size, uint32_t* restrict output_size, uint32_t* restrict num_blocks, uint32_t* restrict max_block_size, uint32_t* restrict max_bit_per_second);
 DANAApiResult DANAEncoder_EncodeWhole(struct DANAEncoder* restrict encoder, const int32_t* const* restrict input, uint32_t num_samples, uint8_t* restrict data, uint32_t data_size, uint32_t* restrict output_size);
 
 #ifdef __cplusplus

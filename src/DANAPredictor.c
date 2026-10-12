@@ -986,13 +986,16 @@ DANAPredictorApiResult DANAOptimalEncodeEstimator_SearchOptimalBlockPartitions(
 
     /* Force candidates to guarantee valid graph edges matching max_block_samples */
     uint32_t max_steps = max_num_block_samples / delta_num_samples;
+    if (max_steps == 0) max_steps = 1;
     uint32_t last_c = 0;
     for (uint32_t k = 1; k < num_nodes; k++) {
         if (is_candidate_node[k]) {
             uint32_t dist = k - last_c;
             if (dist > max_steps) {
                 uint32_t num_splits = (dist + max_steps - 1) / max_steps;
+                if (num_splits == 0) num_splits = 1;
                 uint32_t split_dist = dist / num_splits;
+                if (split_dist == 0) split_dist = 1;
                 for (uint32_t s = 1; s < num_splits; s++) {
                     is_candidate_node[last_c + s * split_dist] = 1;
                 }

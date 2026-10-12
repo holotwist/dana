@@ -34,6 +34,7 @@ static struct CommandLineParserSpecification command_line_spec[] = {
     { 'h', "help", COMMAND_LINE_PARSER_FALSE, "Show command help message", NULL, COMMAND_LINE_PARSER_FALSE },
     { 'v', "version", COMMAND_LINE_PARSER_FALSE, "Show version information", NULL, COMMAND_LINE_PARSER_FALSE },
     { 's', "streaming", COMMAND_LINE_PARSER_FALSE, "Use streaming decode(for debug; 120fps)", NULL, COMMAND_LINE_PARSER_FALSE },
+    { 0, "dag", COMMAND_LINE_PARSER_FALSE, "Enable experimental DAG dynamic block splitting", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "legacy-wav", COMMAND_LINE_PARSER_FALSE, "Include RIFF LIST-INFO along with id3 when decoding to WAV", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "title", COMMAND_LINE_PARSER_TRUE, "Set Title", NULL, COMMAND_LINE_PARSER_FALSE },
     { 0, "artist", COMMAND_LINE_PARSER_TRUE, "Set Artist", NULL, COMMAND_LINE_PARSER_FALSE },
@@ -78,6 +79,7 @@ typedef struct {
 typedef struct {
     struct DANAWaveFormat wave_format;
     struct DANAEncodeParameter enc_param;
+    bool enable_dag;
     StreamSlot slots[STREAM_RING_SLOTS];
     pthread_mutex_t mutex;
     pthread_cond_t cond_empty;
@@ -107,6 +109,7 @@ static void* stream_encode_worker(void* arg) {
         .max_lms_order_per_filter = ctx->enc_param.lms_order_per_filter,
         .verpose_flag             = 0,
         .enable_seek_table        = 0,
+        .enable_dag               = ctx->enable_dag ? 1 : 0,
         .num_threads              = 1
     };
 
@@ -141,15 +144,17 @@ static void* stream_encode_worker(void* arg) {
         const int32_t* input_ptr[DANA_MAX_CHANNELS];
         for (uint32_t ch = 0; ch < ctx->wave_format.num_channels; ch++) input_ptr[ch] = s->pcm[ch];
 
-        uint32_t bsize = 0;
-        DANAApiResult ret = DANAEncoder_EncodeBlock(enc, input_ptr, s->num_samples, tmp_buf, max_buf, &bsize);
+        DANAApiResult ret = DANAEncoder_EncodeChunk(
+            enc, input_ptr, s->num_samples,
+            tmp_buf, max_buf,
+            &s->compressed_size,
+            &s->num_blocks,
+            &s->max_block_size,
+            &s->max_bps);
+
         s->res = ret;
         if (ret == DANA_APIRESULT_OK) {
-            memcpy(s->compressed, tmp_buf, bsize);
-            s->compressed_size = bsize;
-            s->num_blocks = 1;
-            s->max_block_size = bsize;
-            s->max_bps = (8 * bsize * ctx->wave_format.sampling_rate) / s->num_samples;
+            memcpy(s->compressed, tmp_buf, s->compressed_size);
         } else {
             atomic_store(&ctx->error_code, ret);
         }
@@ -289,6 +294,7 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
     memset(&ctx, 0, sizeof(ctx));
     ctx.wave_format = wave_fmt;
     ctx.enc_param   = enc_param;
+    ctx.enable_dag  = CommandLineParser_GetOptionAcquired(command_line_spec, "dag");
     pthread_mutex_init(&ctx.mutex, NULL);
     pthread_cond_init(&ctx.cond_empty, NULL);
     pthread_cond_init(&ctx.cond_queued, NULL);

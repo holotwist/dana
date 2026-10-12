@@ -74,6 +74,7 @@ struct DANAEncoder {
     uint8_t                        lms_num_stages[DANA_MAX_CHANNELS];
     uint8_t                        lms_step_idx[DANA_MAX_CHANNELS][DANA_MAX_LMS_STAGES];
     uint8_t                        enable_seek_table;
+    uint8_t                        enable_dag;
     uint32_t                       num_threads;
 };
 
@@ -85,6 +86,7 @@ struct DANAEncoder* DANAEncoder_Create(const struct DANAEncoderConfig* config) {
 
     encoder->max_num_channels         = config->max_num_channels;
     encoder->enable_seek_table        = config->enable_seek_table;
+    encoder->enable_dag               = config->enable_dag;
     encoder->num_threads              = config->num_threads;
     encoder->max_num_block_samples    = config->max_num_block_samples;
     encoder->max_parcor_order         = config->max_parcor_order;
@@ -405,7 +407,8 @@ DETECT_NOT_SILENCE:
         return DANA_APIRESULT_OK;
     }
 
-    if (encoder->encode_param.search_mode == 0) {
+    // Skip partitioning if search disabled or block smaller than delta
+    if (encoder->encode_param.search_mode == 0 || num_samples <= delta_num_samples) {
         *optimal_num_partitions = 1;
         optimal_num_block_samples[0] = num_samples;
         return DANA_APIRESULT_OK;
@@ -943,6 +946,67 @@ DETECT_NOT_SILENCE:
     return DANA_APIRESULT_OK;
 }
 
+// Encodes a chunk with dynamic block splitting (or single block if disabled)
+DANAApiResult DANAEncoder_EncodeChunk(
+    struct DANAEncoder* restrict encoder,
+    const int32_t* const* restrict input,
+    uint32_t num_samples,
+    uint8_t* restrict data,
+    uint32_t data_size,
+    uint32_t* restrict output_size,
+    uint32_t* restrict num_blocks,
+    uint32_t* restrict max_block_size,
+    uint32_t* restrict max_bit_per_second)
+{
+    if (!encoder || !input || !data || !output_size) return DANA_APIRESULT_INVALID_ARGUMENT;
+
+    uint32_t num_parts = 1;
+    if (encoder->enable_dag && encoder->encode_param.search_mode > 0 && num_samples > DANA_SEARCH_BLOCK_NUM_SAMPLES_DELTA) {
+        DANAApiResult pret = DANAEncoder_SearchOptimalBlockPartitions(
+            encoder, input, num_samples,
+            (uint32_t)DANAUTILITY_MIN(DANA_MIN_BLOCK_NUM_SAMPLES, num_samples),
+            DANA_SEARCH_BLOCK_NUM_SAMPLES_DELTA, num_samples,
+            &num_parts, encoder->num_block_partition_samples);
+        if (pret != DANA_APIRESULT_OK) {
+            num_parts = 1;
+            encoder->num_block_partition_samples[0] = num_samples;
+        }
+    } else {
+        encoder->num_block_partition_samples[0] = num_samples;
+    }
+
+    uint32_t total_bytes = 0;
+    uint32_t offset = 0;
+    uint32_t blocks = 0;
+    uint32_t max_bsize = 0;
+    uint32_t max_bps = 0;
+
+    for (uint32_t part = 0; part < num_parts; part++) {
+        uint32_t n_enc = encoder->num_block_partition_samples[part];
+        const int32_t* part_ptr[DANA_MAX_CHANNELS];
+        for (uint32_t ch = 0; ch < encoder->wave_format.num_channels; ch++) {
+            part_ptr[ch] = &input[ch][offset];
+        }
+
+        uint32_t bsize = 0;
+        DANAApiResult eret = DANAEncoder_EncodeBlock(encoder, part_ptr, n_enc, &data[total_bytes], data_size - total_bytes, &bsize);
+        if (eret != DANA_APIRESULT_OK) return eret;
+
+        total_bytes += bsize;
+        offset += n_enc;
+        blocks++;
+        if (bsize > max_bsize) max_bsize = bsize;
+        uint32_t bps = (n_enc > 0) ? (8 * bsize * encoder->wave_format.sampling_rate) / n_enc : 0;
+        if (bps > max_bps) max_bps = bps;
+    }
+
+    *output_size = total_bytes;
+    if (num_blocks) *num_blocks = blocks;
+    if (max_block_size) *max_block_size = max_bsize;
+    if (max_bit_per_second) *max_bit_per_second = max_bps;
+    return DANA_APIRESULT_OK;
+}
+
 typedef struct {
     uint8_t* data;
     uint32_t size;
@@ -977,6 +1041,7 @@ static void* dana_encode_worker(void* arg) {
         .max_lms_order_per_filter = base->max_lms_order_per_filter,
         .verpose_flag             = 0,
         .enable_seek_table        = 0,
+        .enable_dag               = base->enable_dag,
         .num_threads              = 1
     };
 
@@ -1011,37 +1076,21 @@ static void* dana_encode_worker(void* arg) {
             }
 
             uint32_t step_samples = DANAUTILITY_MIN(enc->encode_param.max_num_block_samples, samples_left);
-            uint32_t num_parts = 1;
+            uint32_t bsize = 0, n_blocks = 0, m_bsize = 0, m_bps = 0;
 
-            if (enc->encode_param.search_mode > 0) {
-                DANAApiResult pret = DANAEncoder_SearchOptimalBlockPartitions(
-                    enc, input_ptr, step_samples,
-                    (uint32_t)DANAUTILITY_MIN(DANA_MIN_BLOCK_NUM_SAMPLES, step_samples),
-                    DANA_SEARCH_BLOCK_NUM_SAMPLES_DELTA, step_samples,
-                    &num_parts, enc->num_block_partition_samples);
-                if (pret != DANA_APIRESULT_OK) { r->res = pret; break; }
-            } else {
-                enc->num_block_partition_samples[0] = step_samples;
-            }
+            DANAApiResult eret = DANAEncoder_EncodeChunk(
+                enc, input_ptr, step_samples,
+                &tmp_buf[chunk_bytes], max_buf - chunk_bytes,
+                &bsize, &n_blocks, &m_bsize, &m_bps);
 
-            for (uint32_t part = 0; part < num_parts; part++) {
-                uint32_t n_enc = enc->num_block_partition_samples[part];
-                for (uint32_t ch = 0; ch < enc->wave_format.num_channels; ch++) {
-                    input_ptr[ch] = &ctx->input[ch][offset];
-                }
+            if (eret != DANA_APIRESULT_OK) { r->res = eret; break; }
 
-                uint32_t bsize = 0;
-                DANAApiResult eret = DANAEncoder_EncodeBlock(enc, input_ptr, n_enc, &tmp_buf[chunk_bytes], max_buf - chunk_bytes, &bsize);
-                if (eret != DANA_APIRESULT_OK) { r->res = eret; break; }
-
-                chunk_bytes += bsize;
-                offset += n_enc;
-                samples_left -= n_enc;
-                r->num_blocks++;
-                if (bsize > r->max_block_size) r->max_block_size = bsize;
-                uint32_t bps = (8 * bsize * enc->wave_format.sampling_rate) / n_enc;
-                if (bps > r->max_bit_per_second) r->max_bit_per_second = bps;
-            }
+            chunk_bytes += bsize;
+            offset += step_samples;
+            samples_left -= step_samples;
+            r->num_blocks += n_blocks;
+            if (m_bsize > r->max_block_size) r->max_block_size = m_bsize;
+            if (m_bps > r->max_bit_per_second) r->max_bit_per_second = m_bps;
         }
 
         if (r->res == DANA_APIRESULT_OK && chunk_bytes > 0) {
