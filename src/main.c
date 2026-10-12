@@ -50,7 +50,7 @@ static struct CommandLineParserSpecification command_line_spec[] = {
 
 static const struct DANAEncodeParameter encode_preset[] = {
     {  8, 0, 4, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,        4096, 0 },
-    {  8, 0, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,        8192, 0 },
+    { 12, 0, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,        8192, 0 },
     { 16, 1, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288, 1 },
     { 32, 3, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       12288, 2 },
     { 40, 3, 8, DANA_CHPROCESSMETHOD_STEREO_MS, DANA_WINDOWFUNCTIONTYPE_TUKEY,       16384, 2 }
@@ -307,8 +307,7 @@ static int do_encode(const char* in_filename, const char* out_filename, uint32_t
         num_threads = (uint32_t)atoi(CommandLineParser_GetArgumentString(command_line_spec, "threads"));
     }
     if (num_threads == 0) {
-        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+        num_threads = DANAUtility_GetPhysicalCoreCount();
     }
     if (num_threads > 64) num_threads = 64;
 
@@ -656,8 +655,7 @@ static int do_decode(const char* in_filename, const char* out_filename, uint8_t 
         num_threads = (uint32_t)atoi(CommandLineParser_GetArgumentString(command_line_spec, "threads"));
     }
     if (num_threads == 0) {
-        long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-        num_threads = (nprocs > 0) ? (uint32_t)nprocs : 4;
+        num_threads = DANAUtility_GetPhysicalCoreCount();
     }
     if (num_threads > 64) num_threads = 64;
 

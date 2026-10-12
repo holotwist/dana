@@ -95,9 +95,11 @@ void draw_vis_panel(int y, int x, int h, int w) {
             }
             for (int gy = 0; gy < draw_h; gy++) {
                 for (int gx = 0; gx < draw_w; gx++) {
-                    uint8_t v = grid[gy * draw_w + gx]; if (v == 0) continue;
+                    uint8_t v = grid[gy * draw_w + gx];
+                    if (v == 0) continue;
                     int color_idx = 6 + (gx * 5) / draw_w;
-                    if (color_idx > 10) color_idx = 10; if (color_idx < 6) color_idx = 6;
+                    if (color_idx > 10) color_idx = 10;
+                    if (color_idx < 6) color_idx = 6;
                     attron(COLOR_PAIR(color_idx));
                     char utf8_braille[4] = {(char)0xE2, (char)(0xA0 | (v >> 6)), (char)(0x80 | (v & 0x3F)), '\0'};
                     mvprintw(y + 2 + gy, x + 2 + gx, "%s", utf8_braille);
@@ -111,7 +113,7 @@ void draw_vis_panel(int y, int x, int h, int w) {
         if (++line < y + h - 1) mvprintw(line,  x + 6, "Decoded %u blocks", atomic_load(&p_decoded_blocks));
         if (++line < y + h - 1) mvprintw(line,  x + 6, "Played %u buffers", atomic_load(&p_played_buffers));
         if (++line < y + h - 1) mvprintw(line,  x + 6, "Lost %u buffers", atomic_load(&p_lost_buffers));
-        if (++line < y + h - 1); // blank
+        if (++line < y + h - 1) {}; // blank
         if (++line < y + h - 1) mvprintw(line,  x + 4, "Input/Read:");
         if (++line < y + h - 1) mvprintw(line,  x + 6, "Media data size %u KiB", atomic_load(&p_media_data_size_kib));
         if (++line < y + h - 1) mvprintw(line,  x + 6, "Input bitrate %u kb/s", atomic_load(&p_input_bitrate_kbs));

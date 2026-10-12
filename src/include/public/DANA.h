@@ -3,7 +3,7 @@
 
 #include "DANAStdint.h"
 
-#define DANA_VERSION_STRING          "1.0.0"
+#define DANA_VERSION_STRING          "1.0.1"
 #define DANA_FORMAT_VERSION          1
 #define DANA_HEADER_SIZE             43
 #define DANA_BLOCK_HEADER_SIZE       9

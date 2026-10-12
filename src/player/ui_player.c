@@ -42,15 +42,18 @@ void draw_player_panel(int y, int x, int h, int w) {
         float db_l = (peak_l < 0.001f) ? -60.0f : 20.0f * log10f(peak_l);
         float db_r = (peak_r < 0.001f) ? -60.0f : 20.0f * log10f(peak_r);
         peak_l = (db_l + 40.0f) / 40.0f; peak_r = (db_r + 40.0f) / 40.0f;
-        if (peak_l < 0.0f) peak_l = 0.0f; if (peak_l > 1.0f) peak_l = 1.0f;
-        if (peak_r < 0.0f) peak_r = 0.0f; if (peak_r > 1.0f) peak_r = 1.0f;
+        if (peak_l < 0.0f) peak_l = 0.0f;
+        if (peak_l > 1.0f) peak_l = 1.0f;
+        if (peak_r < 0.0f) peak_r = 0.0f;
+        if (peak_r > 1.0f) peak_r = 1.0f;
 
         static float smooth_peak_l = 0.0f; static float smooth_peak_r = 0.0f;
         if (peak_l > smooth_peak_l) smooth_peak_l = peak_l; else { smooth_peak_l -= 0.03f; if (smooth_peak_l < 0.0f) smooth_peak_l = 0.0f; }
         if (peak_r > smooth_peak_r) smooth_peak_r = peak_r; else { smooth_peak_r -= 0.03f; if (smooth_peak_r < 0.0f) smooth_peak_r = 0.0f; }
 
         int bar_len = (w - 10) / 2;
-        if (bar_len > 24) bar_len = 24; if (bar_len < 5) bar_len = 5;
+        if (bar_len > 24) bar_len = 24;
+        if (bar_len < 5) bar_len = 5;
 
         int val_l = (int)(smooth_peak_l * bar_len); if (val_l > bar_len) val_l = bar_len;
         int val_r = (int)(smooth_peak_r * bar_len); if (val_r > bar_len) val_r = bar_len;

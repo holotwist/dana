@@ -97,6 +97,7 @@ uint32_t DANADataPacketQueue_GetRemainDataSize(const struct DANADataPacketQueue*
 
 char* DANAUtility_StrDup(const char* s);
 char* DANAUtility_StrNDup(const char* s, size_t n);
+uint32_t DANAUtility_GetPhysicalCoreCount(void);
 
 #ifdef __cplusplus
 }

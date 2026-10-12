@@ -2,11 +2,19 @@
 #include "DANAInternal.h"
 #include "DANA.h"
 
+#include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <float.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 struct DANALESolver {
     uint32_t  max_dim;
@@ -673,4 +681,100 @@ void DANAMetadata_Release(struct DANAMetadata* meta) {
     meta->cover_size = 0;
     NULLCHECK_AND_FREE(meta->seek_table);
     meta->seek_table_size = 0;
+}
+
+uint32_t DANAUtility_GetPhysicalCoreCount(void) {
+#if defined(__APPLE__)
+    int count = 0;
+    size_t size = sizeof(count);
+    if (sysctlbyname("hw.physicalcpu", &count, &size, NULL, 0) == 0 && count > 0) {
+        return (uint32_t)count;
+    }
+#elif defined(_WIN32)
+    DWORD len = 0;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buf = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)malloc(len);
+        if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, buf, &len)) {
+            uint32_t cores = 0;
+            DWORD offset = 0;
+            while (offset < len) {
+                PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((char*)buf + offset);
+                if (info->Relationship == RelationProcessorCore) cores++;
+                offset += info->Size;
+            }
+            free(buf);
+            if (cores > 0) return cores;
+        }
+        if (buf) free(buf);
+    }
+#elif defined(__linux__)
+    FILE* fp = fopen("/proc/cpuinfo", "r");
+    if (fp) {
+        char line[256];
+        int phys_id = 0, core_id = -1;
+        uint32_t* pairs = NULL;
+        uint32_t num_pairs = 0, cap_pairs = 0;
+        bool has_core = false;
+
+        while (fgets(line, sizeof(line), fp)) {
+            if (strncmp(line, "physical id", 11) == 0) {
+                char* p = strchr(line, ':');
+                if (p) phys_id = atoi(p + 1);
+            } else if (strncmp(line, "core id", 7) == 0) {
+                char* p = strchr(line, ':');
+                if (p) {
+                    core_id = atoi(p + 1);
+                    has_core = true;
+                }
+            } else if (line[0] == '\n' || line[0] == '\r') {
+                if (has_core && core_id >= 0) {
+                    uint32_t key = ((uint32_t)phys_id << 16) | (uint32_t)(core_id & 0xFFFF);
+                    bool exists = false;
+                    for (uint32_t i = 0; i < num_pairs; i++) {
+                        if (pairs[i] == key) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        if (num_pairs == cap_pairs) {
+                            cap_pairs = cap_pairs ? cap_pairs * 2 : 32;
+                            pairs = realloc(pairs, sizeof(uint32_t) * cap_pairs);
+                        }
+                        if (pairs) pairs[num_pairs++] = key;
+                    }
+                }
+                phys_id = 0;
+                core_id = -1;
+                has_core = false;
+            }
+        }
+
+        if (has_core && core_id >= 0) {
+            uint32_t key = ((uint32_t)phys_id << 16) | (uint32_t)(core_id & 0xFFFF);
+            bool exists = false;
+            for (uint32_t i = 0; i < num_pairs; i++) {
+                if (pairs[i] == key) { exists = true; break; }
+            }
+            if (!exists) {
+                if (num_pairs == cap_pairs) {
+                    cap_pairs = cap_pairs ? cap_pairs * 2 : 32;
+                    pairs = realloc(pairs, sizeof(uint32_t) * cap_pairs);
+                }
+                if (pairs) pairs[num_pairs++] = key;
+            }
+        }
+        fclose(fp);
+
+        if (pairs) {
+            free(pairs);
+            if (num_pairs > 0) return num_pairs;
+        }
+    }
+#endif
+
+    // Fallback to logical processors
+#if defined(_SC_NPROCESSORS_ONLN)
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nprocs > 0) return (uint32_t)nprocs;
+#endif
+    return 4;
 }
