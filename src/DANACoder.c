@@ -216,9 +216,15 @@ static uint32_t DANARangeDecoder_DecodeFastWithUpdate(DANARangeDecoder* rc, stru
     return res;
 }
 
+// Binary search
 static uint8_t DANARangeDecoder_GetOverflow(uint32_t range_total) {
     uint8_t i = 0;
-    while (range_total >= DANA_RANGE_TOTAL[i + 1]) i++;
+    i += (range_total >= DANA_RANGE_TOTAL[i + 32]) ? 32 : 0;
+    i += (range_total >= DANA_RANGE_TOTAL[i + 16]) ? 16 : 0;
+    i += (range_total >= DANA_RANGE_TOTAL[i + 8])  ? 8  : 0;
+    i += (range_total >= DANA_RANGE_TOTAL[i + 4])  ? 4  : 0;
+    i += (range_total >= DANA_RANGE_TOTAL[i + 2])  ? 2  : 0;
+    i += (range_total >= DANA_RANGE_TOTAL[i + 1])  ? 1  : 0;
     return i;
 }
 
