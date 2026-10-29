@@ -1,4 +1,4 @@
-Dana (Digital Audio Non-lossy Archive)
+Dana (Dana Audio Non-lossy Archive)
 Copyright 2026 holotwist
 
 DANA (Dana or dana) is a lossless audio codec.
