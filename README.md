@@ -273,6 +273,7 @@ echo "get_cover" | nc -U /tmp/danaplayd.sock > cover.jpg
 
 # Stop/kill the daemon
 echo "quit" | nc -U /tmp/danaplayd.sock
+```
 
 ---
 
